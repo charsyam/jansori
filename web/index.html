@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jansori</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #182331; background: #f4f6f8; }
+    body { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    h1, h2 { margin: 0 0 12px; }
+    header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+    .panel { background: white; border: 1px solid #d9e0e6; border-radius: 10px; padding: 18px; margin-bottom: 18px; }
+    .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+    .status-card { border: 1px solid #d9e0e6; border-radius: 8px; padding: 13px; background: #f8fbfd; }
+    .status-card.on { border-color: #b9dec5; background: #f3fbf5; }
+    .status-head { display: flex; align-items: center; gap: 9px; }
+    .status-head strong { flex: 1; }
+    .status-switch { width: 36px; height: 20px; border-radius: 999px; background: #9aabba; position: relative; flex: none; }
+    .status-switch::after { content: ''; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: white; box-shadow: 0 1px 3px #0003; }
+    .status-card.on .status-switch { background: #238454; }
+    .status-card.on .status-switch::after { left: 19px; }
+    .status-badge { font-size: .82rem; color: #526477; white-space: nowrap; }
+    .status-card.on .status-badge { color: #17613c; }
+    .status-reason { margin: 9px 0 0; font-size: .85rem; }
+    [hidden] { display: none !important; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 18px; border-bottom: 1px solid #d9e0e6; }
+    .tabs button { background: transparent; color: #526477; border: 0; border-radius: 0; padding: 10px 20px; }
+    .tabs button[aria-selected="true"] { color: #175b9c; border-bottom: 3px solid #175b9c; font-weight: 700; }
+    .muted { color: #526477; }
+    .error { color: #a92f2f; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    input, select, textarea, button { font: inherit; border: 1px solid #aebcca; border-radius: 6px; padding: 8px; }
+    button { background: #175b9c; border-color: #175b9c; color: white; cursor: pointer; }
+    input, textarea { flex: 1; min-width: 180px; }
+    textarea { width: 100%; min-height: 90px; box-sizing: border-box; }
+    .scroll { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; border-bottom: 1px solid #e5ebf0; padding: 9px; vertical-align: top; }
+    th { color: #526477; white-space: nowrap; }
+    td.sql { max-width: 550px; word-break: break-word; }
+    tr.query-row { cursor: pointer; }
+    tr.query-row:hover, tr.query-row.selected { background: #eaf3fb; }
+    tr.plan-detail td { background: #f8fbfd; border-left: 3px solid #175b9c; }
+    tr.plan-detail details { margin-top: 10px; }
+    .timeline { display: flex; align-items: end; gap: 3px; height: 150px; padding: 14px 0 24px; border-bottom: 1px solid #d9e0e6; }
+    .timeline-bar { flex: 1; min-width: 8px; background: #5a9bd4; border-radius: 3px 3px 0 0; }
+    .timeline-bar.clickable:hover { background: #175b9c; cursor: pointer; }
+    .timeline-empty { align-self: center; width: 100%; text-align: center; color: #526477; }
+    .timeline-labels { display: flex; justify-content: space-between; margin-top: 8px; }
+    .presets button { background: white; color: #175b9c; }
+    .presets button.active { background: #175b9c; color: white; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #f4f6f8; padding: 12px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <header><div><h1>Jansori</h1><div id="database" class="muted">연결 확인 중…</div></div><div id="status" class="muted"></div></header>
+  <section class="panel"><h2>수집 상태</h2><p class="muted">스위치 모양은 현재 상태 표시입니다.</p><div id="capabilities" class="status-grid"></div></section>
+  <div class="row presets" role="group" aria-label="조회 기간">
+    <button data-window="all" class="active">전체 누적</button><button data-window="1m">1분</button><button data-window="5m">5분</button><button data-window="10m">10분</button><button data-window="1h">1시간</button><button data-window="3h">3시간</button><button data-window="1d">1일</button><button data-window="3d">3일</button><button data-window="7d">7일</button>
+  </div>
+  <section id="timeline-panel" class="panel">
+    <h2>기간별 호출</h2>
+    <div id="timeline-title">전체 쿼리 · 최근 7일 호출 추이</div>
+    <p id="timeline-basis" class="muted"></p>
+    <div id="timeline-chart" class="timeline" role="img" aria-label="기간별 쿼리 호출 수"></div>
+    <div id="timeline-labels" class="timeline-labels muted"></div>
+    <div id="timeline-message" class="muted"></div>
+  </section>
+  <nav class="tabs" role="tablist" aria-label="통계 종류">
+    <button id="tab-queries" role="tab" aria-controls="queries-panel" aria-selected="true">쿼리</button>
+    <button id="tab-hosts" role="tab" aria-controls="hosts-panel" aria-selected="false" tabindex="-1">호스트</button>
+  </nav>
+  <div id="queries-panel" role="tabpanel" aria-labelledby="tab-queries">
+  <section class="panel">
+    <h2>쿼리</h2>
+    <div class="row"><label>직접 지정 시작 <input id="range-from" type="datetime-local" step="60"></label><label>끝 (해당 분 포함) <input id="range-to" type="datetime-local" step="60"></label><button id="range-apply">시간 적용</button><button id="range-clear">전체 누적으로 돌아가기</button></div>
+    <div class="muted">기간은 최근 7일까지 선택할 수 있습니다. 그래프의 막대를 클릭하면 해당 구간으로 좁힙니다.</div>
+    <div class="row"><input id="query-search" placeholder="SQL 텍스트 검색"><input id="query-host" placeholder="호스트 필터 (MySQL)"><select id="query-sort"><option value="calls">호출 수</option><option value="total_time">총 실행 시간</option><option value="mean_time">평균 실행 시간</option></select><button id="query-refresh">조회</button></div>
+    <div id="query-message" class="muted">쿼리를 클릭하면 바로 아래에 실행 계획이 표시됩니다.</div>
+    <div class="scroll"><table><thead><tr><th>쿼리</th><th>호출 수</th><th>총 시간 (ms)</th><th>평균 시간 (ms)</th><th>출처</th></tr></thead><tbody id="queries"></tbody></table></div>
+    <div class="row" style="align-items:center; margin-top:12px">
+      <label>페이지당 <select id="query-page-size"><option value="10" selected>10개</option><option value="25">25개</option><option value="50">50개</option><option value="100">100개</option></select></label>
+      <button id="query-prev" type="button">이전</button><span id="query-page-info" class="muted">1페이지</span><button id="query-next" type="button">다음</button>
+    </div>
+  </section>
+  </div>
+  <div id="hosts-panel" role="tabpanel" aria-labelledby="tab-hosts" hidden>
+    <section class="panel"><h2>호스트</h2><p class="muted">현재 접속과 전체 누적 값입니다. 시간 범위 필터는 쿼리 통계에 적용됩니다.</p><div class="scroll"><table><thead><tr><th>호스트</th><th>현재 접속</th><th>수집된 쿼리</th></tr></thead><tbody id="hosts"></tbody></table></div></section>
+  </div>
+  <script>
+    const $ = id => document.getElementById(id);
+    const capabilityLabels = {
+      read_only_connection: '읽기 전용 연결',
+      query_statistics: '쿼리 통계',
+      host_statistics: '호스트 통계',
+      recent_statements: '최근 문장',
+      explain: '실행 계획'
+    };
+    const cell = value => { const td = document.createElement('td'); td.textContent = value == null ? '정보 없음' : String(value); return td; };
+    let queryRows = [];
+    let selectedKey = null;
+    let selectedPlan = null;
+    let selectedError = null;
+    let selectedLoading = false;
+    let selectionRequest = 0;
+    let timelineRequest = 0;
+    let queryRequest = 0;
+    let pageIndex = 0;
+    let pageTotal = 0;
+    let pageTotalExact = true;
+    let activeRange = null;
+    let activeWindow = 'all';
+    let databaseKind = null;
+    const windowLabels = { all: '전체 누적', '1m': '1분', '5m': '5분', '10m': '10분', '1h': '1시간', '3h': '3시간', '1d': '1일', '3d': '3일', '7d': '7일' };
+    const ms = value => value == null ? '정보 없음' : Number(value).toFixed(5);
+    function clearQuerySelection() {
+      selectedKey = null;
+      selectedPlan = null;
+      selectedError = null;
+      selectedLoading = false;
+      selectionRequest++;
+    }
+    function refreshFirstPage() {
+      pageIndex = 0;
+      clearQuerySelection();
+      Promise.all([refreshQueries(), refreshTimeline()]);
+    }
+    function updatePeriodControls() {
+      for (const button of document.querySelectorAll('[data-window]')) {
+        button.classList.toggle('active', !activeRange && button.dataset.window === activeWindow);
+        button.setAttribute('aria-pressed', String(!activeRange && button.dataset.window === activeWindow));
+      }
+      for (const option of $('query-sort').options) option.disabled = databaseKind === 'MySql' && option.value !== 'calls';
+      if ($('query-sort').selectedOptions[0]?.disabled) $('query-sort').value = 'calls';
+    }
+    function selectTab(name) {
+      const queries = name === 'queries';
+      $('queries-panel').hidden = !queries;
+      $('hosts-panel').hidden = queries;
+      for (const [tab, selected] of [['tab-queries', queries], ['tab-hosts', !queries]]) {
+        $(tab).setAttribute('aria-selected', String(selected));
+        $(tab).tabIndex = selected ? 0 : -1;
+      }
+    }
+    function rangeParams(params) {
+      if (activeRange) {
+        params.set('from', String(activeRange.from));
+        params.set('to', String(activeRange.to));
+      } else if (activeWindow !== 'all') params.set('window', activeWindow);
+      return params;
+    }
+    function localMinute(epochSeconds) {
+      const date = new Date(epochSeconds * 1000);
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+      return local.toISOString().slice(0, 16);
+    }
+    async function getJson(url, options) {
+      const response = await fetch(url, options);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '조회 실패');
+      return data;
+    }
+    async function refresh() {
+      try {
+        const [info, capabilities] = await Promise.all([getJson('/api/info'), getJson('/api/capabilities')]);
+        databaseKind = info.kind;
+        updatePeriodControls();
+        $('database').textContent = `${info.display_name} ${info.version}`;
+        $('capabilities').replaceChildren();
+        for (const [name, value] of Object.entries(capabilities)) {
+          const card = document.createElement('div');
+          card.className = `status-card ${value.available ? 'on' : 'off'}`;
+          const head = document.createElement('div');
+          head.className = 'status-head';
+          const indicator = document.createElement('span');
+          indicator.className = 'status-switch';
+          indicator.setAttribute('aria-hidden', 'true');
+          const label = document.createElement('strong');
+          label.textContent = capabilityLabels[name] || name;
+          const badge = document.createElement('span');
+          badge.className = 'status-badge';
+          badge.textContent = value.available ? '사용 가능' : '사용 불가';
+          head.append(indicator, label, badge);
+          card.append(head);
+          if (!value.available && value.reason) {
+            const reason = document.createElement('p');
+            reason.className = 'status-reason muted';
+            reason.textContent = value.reason;
+            card.append(reason);
+          }
+          $('capabilities').append(card);
+        }
+      } catch (error) { $('status').textContent = error.message; }
+      await Promise.all([refreshQueries(), refreshHosts(), refreshTimeline()]);
+    }
+    async function refreshQueries() {
+      const request = ++queryRequest;
+      const pageSize = Number($('query-page-size').value);
+      const params = rangeParams(new URLSearchParams({ sort: $('query-sort').value, limit: String(pageSize), offset: String(pageIndex * pageSize) }));
+      if ($('query-search').value) params.set('search', $('query-search').value);
+      if ($('query-host').value) params.set('host', $('query-host').value);
+      try {
+        const page = await getJson(`/api/queries/page?${params}`);
+        if (request !== queryRequest) return;
+        if (pageIndex > 0 && page.offset >= page.total) {
+          pageIndex = Math.max(0, Math.ceil(page.total / pageSize) - 1);
+          return refreshQueries();
+        }
+        queryRows = page.items;
+        pageTotal = page.total;
+        pageTotalExact = page.total_is_exact;
+        const totalText = `${pageTotal.toLocaleString()}${pageTotalExact ? '' : ' 이상'}`;
+        const period = activeRange ? '직접 지정한 기간' : activeWindow === 'all' ? '전체 누적' : `최근 ${windowLabels[activeWindow]}`;
+        $('query-message').textContent = `총 ${totalText}개 쿼리 · ${period}${activeWindow === 'all' && !activeRange ? '' : ' · Jansori 실행 이후 관측'} · 클릭하면 실행 계획 표시`;
+        $('query-page-info').textContent = `${pageIndex + 1} / ${Math.max(1, Math.ceil(pageTotal / pageSize))}페이지`;
+        $('query-prev').disabled = pageIndex === 0;
+        $('query-next').disabled = (pageIndex + 1) * pageSize >= pageTotal;
+        renderQueries();
+      } catch (error) { if (request === queryRequest) { $('query-message').textContent = error.message; $('queries').replaceChildren(); $('query-prev').disabled = true; $('query-next').disabled = true; } }
+    }
+    function planText(plan) {
+      const lines = [];
+      function visit(node, depth) {
+        const parts = [node.operation];
+        if (node.relation) parts.push(`테이블: ${node.relation}`);
+        if (node.index_name) parts.push(`인덱스: ${node.index_name}`);
+        if (node.estimated_rows != null) parts.push(`예상 행: ${node.estimated_rows}`);
+        if (node.estimated_cost != null) parts.push(`예상 비용: ${node.estimated_cost}`);
+        lines.push(`${'  '.repeat(depth)}${parts.join(' · ')}`);
+        for (const child of node.children) visit(child, depth + 1);
+      }
+      visit(plan.root, 0);
+      return lines.join('\n');
+    }
+    function renderQueries() {
+      $('queries').replaceChildren();
+      for (const row of queryRows) {
+          const tr = document.createElement('tr');
+          tr.className = 'query-row' + (row.key === selectedKey ? ' selected' : '');
+          const sql = cell(row.statement_text); sql.className = 'sql';
+          tr.title = '클릭하면 실행 계획을 조회';
+          tr.onclick = () => selectQuery(row);
+          tr.append(sql, cell(row.calls), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(row.source));
+          $('queries').append(tr);
+          if (row.key === selectedKey) {
+            const detail = document.createElement('tr');
+            detail.className = 'plan-detail';
+            const td = document.createElement('td');
+            td.colSpan = 5;
+            if (selectedLoading) {
+              td.textContent = '실행 계획 조회 중…';
+            } else if (selectedError) {
+              td.textContent = selectedError;
+              td.className = 'error';
+            } else if (selectedPlan) {
+              const title = document.createElement('strong');
+              title.textContent = selectedPlan.generic ? '범용 추정 계획 · 실제 값에 따라 달라질 수 있음' : '현재 추정 계획';
+              const summary = document.createElement('pre');
+              summary.textContent = planText(selectedPlan);
+              const details = document.createElement('details');
+              const label = document.createElement('summary');
+              label.textContent = '원본 JSON 보기';
+              const raw = document.createElement('pre');
+              raw.textContent = JSON.stringify(JSON.parse(selectedPlan.raw_json), null, 2);
+              details.append(label, raw);
+              td.append(title, summary, details);
+            }
+            detail.append(td);
+            $('queries').append(detail);
+          }
+      }
+    }
+    async function refreshTimeline() {
+      const key = selectedKey;
+      const request = ++timelineRequest;
+      const params = rangeParams(new URLSearchParams());
+      if (!activeRange && activeWindow === 'all') params.set('hours', '168');
+      if (key) params.set('query_key', key);
+      const graphPeriod = activeRange ? '직접 지정한 기간' : activeWindow === 'all' ? '최근 7일 호출 추이' : `최근 ${windowLabels[activeWindow]}`;
+      $('timeline-title').textContent = `${key ? '선택한 쿼리' : '전체 쿼리'} · ${graphPeriod}`;
+      try {
+        const timeline = await getJson(`/api/timeline?${params}`);
+        if (request !== timelineRequest) return;
+        $('timeline-basis').textContent = (activeWindow === 'all' && !activeRange ? '아래의 누적 목록과 달리 그래프는 Jansori 실행 이후 최근 7일만 보여줍니다. ' : '') + (timeline.basis === 'ReceivedAtServer'
+          ? 'MySQL general log 수신 시각 기준 · 실행 시작 시각과 다를 수 있습니다.'
+          : 'PostgreSQL 누적 호출 수의 수집 시각 기준 · 실제 실행 시작 시각은 알 수 없습니다.');
+        const chart = $('timeline-chart');
+        chart.replaceChildren();
+        const maximum = Math.max(1, ...timeline.buckets.map(bucket => bucket.calls));
+        let total = 0;
+        for (const bucket of timeline.buckets) {
+          total += bucket.calls;
+          const bar = document.createElement('div');
+          bar.className = 'timeline-bar';
+          bar.style.height = `${Math.max(bucket.calls ? 4 : 1, (bucket.calls / maximum) * 100)}%`;
+          bar.style.opacity = bucket.calls ? '1' : '0.25';
+          bar.title = `${new Date(bucket.start_epoch_seconds * 1000).toLocaleString()} · ${bucket.calls}회`;
+          if (timeline.bucket_seconds >= 60) {
+            bar.classList.add('clickable');
+            bar.onclick = () => {
+              $('range-from').value = localMinute(bucket.start_epoch_seconds);
+              const lastMinute = activeRange ? activeRange.to : Math.floor(Date.now() / 60000) * 60;
+              $('range-to').value = localMinute(Math.min(bucket.start_epoch_seconds + timeline.bucket_seconds - 60, lastMinute));
+              applyRange();
+            };
+          }
+          chart.append(bar);
+        }
+        if (total === 0) {
+          const empty = document.createElement('p');
+          empty.className = 'timeline-empty';
+          empty.textContent = '선택한 기간에 수집된 호출이 없습니다. 수집 시작 이후 새 쿼리가 실행되면 그래프가 표시됩니다.';
+          chart.replaceChildren(empty);
+        }
+        chart.setAttribute('aria-label', `${graphPeriod} 동안 ${total}회 호출`);
+        const labels = $('timeline-labels');
+        labels.replaceChildren();
+        if (timeline.buckets.length) {
+          for (const bucket of [timeline.buckets[0], timeline.buckets[timeline.buckets.length - 1]]) {
+            const label = document.createElement('span');
+            label.textContent = new Date(bucket.start_epoch_seconds * 1000).toLocaleString();
+            labels.append(label);
+          }
+        }
+        $('timeline-message').textContent = `표시 구간 합계 ${total}회 · 시간은 브라우저의 현지 시간대`;
+      } catch (error) {
+        if (request === timelineRequest) $('timeline-message').textContent = error.message;
+      }
+    }
+    function applyRange() {
+      const from = $('range-from').value;
+      const to = $('range-to').value;
+      if (!from || !to) { $('query-message').textContent = '시작과 끝 시각을 함께 선택하세요.'; return; }
+      const start = Math.floor(new Date(from).getTime() / 60000) * 60;
+      const end = Math.floor(new Date(to).getTime() / 60000) * 60;
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start > end) { $('query-message').textContent = '올바른 시간 범위를 선택하세요.'; return; }
+      activeRange = { from: start, to: end };
+      updatePeriodControls();
+      refreshFirstPage();
+    }
+    async function selectQuery(row) {
+      if (selectedKey === row.key) {
+        selectedKey = null;
+        selectionRequest++;
+        renderQueries();
+        refreshTimeline();
+        return;
+      }
+      selectedKey = row.key;
+      selectedPlan = null;
+      selectedError = null;
+      selectedLoading = true;
+      const request = ++selectionRequest;
+      renderQueries();
+      refreshTimeline();
+      try {
+        const plan = await getJson(`/api/queries/${encodeURIComponent(row.key)}/explain`);
+        if (request !== selectionRequest) return;
+        selectedPlan = plan;
+      } catch (error) {
+        if (request !== selectionRequest) return;
+        selectedError = error.message;
+      } finally {
+        if (request === selectionRequest) {
+          selectedLoading = false;
+          renderQueries();
+        }
+      }
+    }
+    async function refreshHosts() {
+      try {
+        const rows = await getJson('/api/hosts?limit=100');
+        $('hosts').replaceChildren();
+        for (const row of rows) { const tr = document.createElement('tr'); tr.append(cell(row.host), cell(row.current_connections), cell(row.statement_calls)); $('hosts').append(tr); }
+      } catch (error) { $('hosts').replaceChildren(); $('status').textContent = error.message; }
+    }
+    $('query-refresh').onclick = refreshFirstPage;
+    $('query-page-size').onchange = refreshFirstPage;
+    $('query-sort').onchange = refreshFirstPage;
+    $('query-prev').onclick = () => {
+      if (pageIndex === 0) return;
+      pageIndex--;
+      clearQuerySelection();
+      Promise.all([refreshQueries(), refreshTimeline()]);
+    };
+    $('query-next').onclick = () => {
+      if ((pageIndex + 1) * Number($('query-page-size').value) >= pageTotal) return;
+      pageIndex++;
+      clearQuerySelection();
+      Promise.all([refreshQueries(), refreshTimeline()]);
+    };
+    for (const button of document.querySelectorAll('[data-window]')) {
+      button.onclick = () => {
+        activeWindow = button.dataset.window;
+        activeRange = null;
+        $('range-from').value = '';
+        $('range-to').value = '';
+        updatePeriodControls();
+        refreshFirstPage();
+      };
+    }
+    $('tab-queries').onclick = () => selectTab('queries');
+    $('tab-hosts').onclick = () => selectTab('hosts');
+    for (const tab of [$('tab-queries'), $('tab-hosts')]) {
+      tab.onkeydown = event => {
+        if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+        event.preventDefault();
+        const next = tab.id === 'tab-queries' ? 'hosts' : 'queries';
+        selectTab(next);
+        $(`tab-${next}`).focus();
+      };
+    }
+    $('range-apply').onclick = applyRange;
+    $('range-clear').onclick = () => {
+      activeRange = null;
+      activeWindow = 'all';
+      updatePeriodControls();
+      $('range-from').value = '';
+      $('range-to').value = '';
+      refreshFirstPage();
+    };
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
