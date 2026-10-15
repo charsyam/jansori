@@ -4,8 +4,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::model::{
-    Capabilities, DatabaseInfo, ExplainPlan, ExplainRequest, HostFilter, HostStats, QueryFilter,
-    QueryKey, QuerySort, QueryStats, RecentStatement, Timeline,
+    BottleneckStats, Capabilities, DatabaseInfo, ExplainPlan, ExplainRequest, HostFilter,
+    HostStats, QueryFilter, QueryKey, QuerySort, QueryStats, RecentStatement, Timeline,
 };
 use crate::timeline::MinuteRange;
 
@@ -90,6 +90,27 @@ pub trait DatabaseBackend: Send + Sync {
         rows: Vec<QueryStats>,
     ) -> BackendFuture<'a, Vec<QueryStats>> {
         Box::pin(async move { Ok(rows) })
+    }
+    fn bottlenecks<'a>(
+        &'a self,
+        _namespace: Option<&'a str>,
+        _range: Option<MinuteRange>,
+        _limit: usize,
+    ) -> BackendFuture<'a, Vec<BottleneckStats>> {
+        Box::pin(async {
+            Err(BackendError {
+                kind: BackendErrorKind::Unsupported,
+                message: "이 데이터베이스는 병목 통계를 지원하지 않습니다".into(),
+            })
+        })
+    }
+    fn explain_bottleneck<'a>(&'a self, _key: &'a str) -> BackendFuture<'a, ExplainPlan> {
+        Box::pin(async {
+            Err(BackendError {
+                kind: BackendErrorKind::Unsupported,
+                message: "이 데이터베이스는 병목 실행 계획을 지원하지 않습니다".into(),
+            })
+        })
     }
     fn host_stats<'a>(&'a self, filter: &'a HostFilter) -> BackendFuture<'a, Vec<HostStats>>;
     fn recent_statements(&self, limit: u32) -> BackendFuture<'_, Vec<RecentStatement>>;

@@ -1,30 +1,56 @@
 //! MySQL implementation of the common backend contract.
 
+use std::collections::HashSet;
+
 use sqlx::{AssertSqlSafe, MySqlPool, Row};
 
 use crate::backend::{BackendError, BackendErrorKind, BackendFuture, DatabaseBackend};
 use crate::model::{
-    AccessKind, Capabilities, Capability, DatabaseInfo, DatabaseKind, ExplainOutput, ExplainPlan,
-    ExplainRequest, HostFilter, HostStats, PlanNode, QueryFilter, QueryKey, QuerySort, QueryStats,
-    RecentStatement, Timeline,
+    AccessKind, BottleneckStats, Capabilities, Capability, DatabaseInfo, DatabaseKind,
+    ExplainOutput, ExplainPlan, ExplainRequest, HostFilter, HostStats, PlanNode, QueryFilter,
+    QueryKey, QuerySort, QueryStats, RecentStatement, Timeline,
 };
 
 use super::general_log::GeneralLogCollector;
+use super::performance::PerformanceCollector;
 use crate::timeline::MinuteRange;
 
 pub struct MySqlBackend {
     pool: MySqlPool,
     general_log: GeneralLogCollector,
+    performance: PerformanceCollector,
 }
 
 impl MySqlBackend {
     pub async fn new(pool: MySqlPool) -> Result<Self, BackendError> {
         let general_log = GeneralLogCollector::new(pool.clone(), 2_000, 5_000, 200).await?;
-        Ok(Self { pool, general_log })
+        let databases: Vec<String> = sqlx::query_scalar("SHOW DATABASES")
+            .fetch_all(&pool)
+            .await
+            .map_err(query_error)?;
+        let allowed_schemas: HashSet<_> = databases
+            .into_iter()
+            .filter(|name| {
+                !matches!(
+                    name.as_str(),
+                    "information_schema" | "mysql" | "performance_schema" | "sys"
+                )
+            })
+            .collect();
+        let performance = PerformanceCollector::new(pool.clone(), allowed_schemas);
+        Ok(Self {
+            pool,
+            general_log,
+            performance,
+        })
     }
 
     pub async fn poll_general_log(&self) -> Result<usize, BackendError> {
         self.general_log.poll().await
+    }
+
+    pub async fn poll_performance(&self) -> Result<(), BackendError> {
+        self.performance.poll().await
     }
 }
 
@@ -251,6 +277,33 @@ impl DatabaseBackend for MySqlBackend {
                 }
             }
             Ok(rows)
+        })
+    }
+
+    fn bottlenecks<'a>(
+        &'a self,
+        namespace: Option<&'a str>,
+        range: Option<MinuteRange>,
+        limit: usize,
+    ) -> BackendFuture<'a, Vec<BottleneckStats>> {
+        Box::pin(async move { self.performance.list(namespace, range, limit).await })
+    }
+
+    fn explain_bottleneck<'a>(&'a self, key: &'a str) -> BackendFuture<'a, ExplainPlan> {
+        Box::pin(async move {
+            let (namespace, sql) =
+                self.performance
+                    .sample_sql(key)
+                    .await
+                    .ok_or_else(|| BackendError {
+                        kind: BackendErrorKind::InvalidRequest,
+                        message: "수집된 쿼리 묶음을 찾을 수 없습니다".into(),
+                    })?;
+            self.explain(&ExplainRequest {
+                namespace: Some(namespace),
+                sql,
+            })
+            .await
         })
     }
 

@@ -19,6 +19,10 @@ pub struct MinuteRange {
 }
 
 impl MinuteRange {
+    pub fn recent_five_second_bounds(&self) -> Option<(u64, u64)> {
+        self.recent_end
+            .map(|end| (end.saturating_sub(self.recent_buckets - 1), end))
+    }
     pub fn recent(minutes: u64) -> Self {
         let end = current_epoch_minute();
         Self {

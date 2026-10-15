@@ -192,6 +192,26 @@ async fn query_page(
     }))
 }
 
+async fn bottlenecks(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> ApiResult<Vec<jansori::model::BottleneckStats>> {
+    let range = selected_range(params.from, params.to, params.window.as_deref())?;
+    Ok(Json(
+        state
+            .backend
+            .bottlenecks(params.namespace.as_deref(), range, 100)
+            .await?,
+    ))
+}
+
+async fn explain_bottleneck(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<jansori::model::ExplainPlan> {
+    Ok(Json(state.backend.explain_bottleneck(&key).await?))
+}
+
 async fn query_rows(
     state: &AppState,
     params: &ListParams,
@@ -338,6 +358,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+        let performance_collector = mysql.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(5));
+            let mut previous_error = String::new();
+            loop {
+                timer.tick().await;
+                match performance_collector.poll_performance().await {
+                    Ok(()) => previous_error.clear(),
+                    Err(error) if error.message != previous_error => {
+                        eprintln!("performance schema: {error}");
+                        previous_error = error.message;
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
         backend = mysql;
     } else if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
         let pool = PgPoolOptions::new()
@@ -388,6 +424,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/capabilities", get(capabilities))
         .route("/api/queries", get(queries))
         .route("/api/queries/page", get(query_page))
+        .route("/api/bottlenecks", get(bottlenecks))
+        .route("/api/bottlenecks/{key}/explain", get(explain_bottleneck))
         .route("/api/hosts", get(hosts))
         .route("/api/recent", get(recent))
         .route("/api/timeline", get(timeline))

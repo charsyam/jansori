@@ -102,6 +102,18 @@ pub struct QueryStats {
     pub no_good_index_used: Option<u64>,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BottleneckStats {
+    pub key: String,
+    pub namespace: String,
+    pub statement_text: String,
+    pub calls: u64,
+    pub total_time_ms: f64,
+    pub mean_time_ms: f64,
+    pub rows_examined: u64,
+    pub rows_sent: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub struct HostFilter {
     pub namespace: Option<String>,

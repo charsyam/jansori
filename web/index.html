@@ -67,21 +67,14 @@
 </head>
 <body>
   <header><div><h1>Jansori</h1><div id="database" class="muted">연결 확인 중…</div></div><div id="status" class="muted"></div></header>
-  <section class="panel"><h2>수집 상태</h2><p class="muted">스위치 모양은 현재 상태 표시입니다.</p><div id="capabilities" class="status-grid"></div></section>
+  <details class="panel"><summary>수집 상태</summary><p class="muted">스위치 모양은 현재 상태 표시입니다.</p><div id="capabilities" class="status-grid"></div></details>
   <div class="row"><label>데이터베이스 <select id="database-filter"><option value="">모든 DB</option></select></label><span id="database-filter-note" class="muted"></span></div>
   <div class="row presets" role="group" aria-label="조회 기간">
     <button data-window="all" class="active">전체 누적</button><button data-window="1m">1분</button><button data-window="5m">5분</button><button data-window="10m">10분</button><button data-window="1h">1시간</button><button data-window="3h">3시간</button><button data-window="1d">1일</button><button data-window="3d">3일</button><button data-window="7d">7일</button>
   </div>
-  <section id="timeline-panel" class="panel">
-    <h2>기간별 호출</h2>
-    <div id="timeline-title">전체 쿼리 · 최근 7일 호출 추이</div>
-    <p id="timeline-basis" class="muted"></p>
-    <div id="timeline-chart" class="timeline" role="img" aria-label="기간별 쿼리 호출 수"></div>
-    <div id="timeline-labels" class="timeline-labels muted"></div>
-    <div id="timeline-message" class="muted"></div>
-  </section>
   <nav class="tabs" role="tablist" aria-label="통계 종류">
     <button id="tab-queries" role="tab" aria-controls="queries-panel" aria-selected="true">쿼리</button>
+    <button id="tab-bottlenecks" role="tab" aria-controls="bottlenecks-panel" aria-selected="false" tabindex="-1">병목</button>
     <button id="tab-hosts" role="tab" aria-controls="hosts-panel" aria-selected="false" tabindex="-1">호스트</button>
   </nav>
   <div id="queries-panel" role="tabpanel" aria-labelledby="tab-queries">
@@ -98,9 +91,24 @@
     </div>
   </section>
   </div>
+  <div id="bottlenecks-panel" role="tabpanel" aria-labelledby="tab-bottlenecks" hidden>
+    <section class="panel">
+      <h2>병목 쿼리 묶음</h2>
+      <p id="bottlenecks-message" class="muted">선택한 기간의 실제 총 실행 시간순으로 표시합니다.</p>
+      <div class="scroll"><table><thead><tr><th>DB</th><th>쿼리 유형</th><th>호출 수</th><th>총 시간 (ms)</th><th>평균 시간 (ms)</th><th>실행당 검사 행</th><th>실행당 반환 행</th></tr></thead><tbody id="bottlenecks"></tbody></table></div>
+    </section>
+  </div>
   <div id="hosts-panel" role="tabpanel" aria-labelledby="tab-hosts" hidden>
     <section class="panel"><h2>호스트</h2><p class="muted">현재 접속과 전체 누적 값입니다. 시간 범위 필터는 쿼리 통계에 적용됩니다.</p><div class="scroll"><table><thead><tr><th>호스트</th><th>현재 접속</th><th>수집된 쿼리</th></tr></thead><tbody id="hosts"></tbody></table></div></section>
   </div>
+  <section id="timeline-panel" class="panel">
+    <h2>기간별 호출</h2>
+    <div id="timeline-title">전체 쿼리 · 최근 7일 호출 추이</div>
+    <p id="timeline-basis" class="muted"></p>
+    <div id="timeline-chart" class="timeline" role="img" aria-label="기간별 쿼리 호출 수"></div>
+    <div id="timeline-labels" class="timeline-labels muted"></div>
+    <div id="timeline-message" class="muted"></div>
+  </section>
   <script>
     const $ = id => document.getElementById(id);
     const capabilityLabels = {
@@ -126,6 +134,10 @@
     let activeRange = null;
     let activeWindow = 'all';
     let databaseKind = null;
+    let bottleneckRows = [];
+    let selectedBottleneck = null;
+    let bottleneckPlan = null;
+    let bottleneckError = null;
     const planCache = new Map();
     const planResults = new Map();
     const selectedDatabase = () => $('database-filter').value;
@@ -142,7 +154,7 @@
     function refreshFirstPage() {
       pageIndex = 0;
       clearQuerySelection();
-      Promise.all([refreshQueries(), refreshTimeline()]);
+      Promise.all([refreshQueries(), refreshBottlenecks(), refreshTimeline()]);
     }
     function updatePeriodControls() {
       for (const button of document.querySelectorAll('[data-window]')) {
@@ -158,10 +170,10 @@
       if ($('query-sort').selectedOptions[0]?.disabled) $('query-sort').value = 'calls';
     }
     function selectTab(name) {
-      const queries = name === 'queries';
-      $('queries-panel').hidden = !queries;
-      $('hosts-panel').hidden = queries;
-      for (const [tab, selected] of [['tab-queries', queries], ['tab-hosts', !queries]]) {
+      for (const kind of ['queries', 'bottlenecks', 'hosts']) {
+        $(`${kind}-panel`).hidden = kind !== name;
+      }
+      for (const [tab, selected] of [['tab-queries', name === 'queries'], ['tab-bottlenecks', name === 'bottlenecks'], ['tab-hosts', name === 'hosts']]) {
         $(tab).setAttribute('aria-selected', String(selected));
         $(tab).tabIndex = selected ? 0 : -1;
       }
@@ -241,6 +253,8 @@
       try {
         const [info, capabilities, databases] = await Promise.all([getJson('/api/info'), getJson('/api/capabilities'), getJson('/api/databases')]);
         databaseKind = info.kind;
+        $('tab-bottlenecks').hidden = databaseKind !== 'MySql';
+        if (databaseKind !== 'MySql' && $('tab-bottlenecks').getAttribute('aria-selected') === 'true') selectTab('queries');
         updatePeriodControls();
         $('database').textContent = `${info.display_name} ${info.version}`;
         const selector = $('database-filter');
@@ -278,7 +292,70 @@
           $('capabilities').append(card);
         }
       } catch (error) { $('status').textContent = error.message; }
-      await Promise.all([refreshQueries(), refreshHosts(), refreshTimeline()]);
+      await Promise.all([refreshQueries(), refreshBottlenecks(), refreshHosts(), refreshTimeline()]);
+    }
+    async function refreshBottlenecks() {
+      if (databaseKind !== 'MySql') return;
+      const params = rangeParams(new URLSearchParams());
+      if (selectedDatabase()) params.set('namespace', selectedDatabase());
+      try {
+        bottleneckRows = await getJson(`/api/bottlenecks?${params}`);
+        const period = activeRange ? '직접 지정한 기간' : activeWindow === 'all' ? 'Jansori 실행 이후' : `최근 ${windowLabels[activeWindow]}`;
+        $('bottlenecks-message').textContent = `${period} · 실제 총 실행 시간순 · MySQL 쿼리 유형별 통계의 증가분을 5초마다 수집합니다. 수집 전 실행분은 제외됩니다.`;
+        renderBottlenecks();
+      } catch (error) {
+        $('bottlenecks-message').textContent = error.message;
+        $('bottlenecks').replaceChildren();
+      }
+    }
+    function renderBottlenecks() {
+      $('bottlenecks').replaceChildren();
+      for (const row of bottleneckRows) {
+        const tr = document.createElement('tr');
+        tr.className = 'query-row' + (selectedBottleneck === row.key ? ' selected' : '');
+        tr.append(cell(row.namespace), cell(row.statement_text), cell(row.calls.toLocaleString()), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(Math.round(row.rows_examined / row.calls).toLocaleString()), cell(Math.round(row.rows_sent / row.calls).toLocaleString()));
+        tr.onclick = async () => {
+          selectedBottleneck = selectedBottleneck === row.key ? null : row.key;
+          bottleneckPlan = null;
+          bottleneckError = null;
+          renderBottlenecks();
+          if (!selectedBottleneck) return;
+          try {
+            const plan = await getJson(`/api/bottlenecks/${encodeURIComponent(row.key)}/explain`);
+            if (selectedBottleneck === row.key) bottleneckPlan = plan;
+          } catch (error) {
+            if (selectedBottleneck === row.key) bottleneckError = error.message;
+          }
+          renderBottlenecks();
+        };
+        $('bottlenecks').append(tr);
+        if (selectedBottleneck === row.key) {
+          const detail = document.createElement('tr');
+          detail.className = 'plan-detail';
+          const td = document.createElement('td');
+          td.colSpan = 7;
+          const summary = document.createElement('p');
+          summary.textContent = `실제 통계 · ${row.calls.toLocaleString()}회 · 총 ${ms(row.total_time_ms)} ms · 검사 ${row.rows_examined.toLocaleString()}행 · 반환 ${row.rows_sent.toLocaleString()}행`;
+          td.append(summary);
+          if (bottleneckPlan) {
+            const heading = document.createElement('strong');
+            heading.textContent = '대표 SQL의 현재 추정 실행 계획';
+            const assessment = indexAssessment(bottleneckPlan);
+            const note = document.createElement('p');
+            note.className = 'muted';
+            note.textContent = '대표 SQL의 계획은 묶음 안의 모든 값에 동일하게 적용되지 않을 수 있습니다.';
+            const plan = document.createElement('pre');
+            plan.textContent = planText(bottleneckPlan);
+            td.append(heading, note, indexTable(assessment, bottleneckPlan.database), plan);
+          } else {
+            const note = document.createElement('p');
+            note.textContent = bottleneckError || '실행 계획 조회 중…';
+            td.append(note);
+          }
+          detail.append(td);
+          $('bottlenecks').append(detail);
+        }
+      }
     }
     async function refreshQueries() {
       const request = ++queryRequest;
@@ -655,12 +732,15 @@
       };
     }
     $('tab-queries').onclick = () => selectTab('queries');
+    $('tab-bottlenecks').onclick = () => selectTab('bottlenecks');
     $('tab-hosts').onclick = () => selectTab('hosts');
-    for (const tab of [$('tab-queries'), $('tab-hosts')]) {
+    for (const tab of [$('tab-queries'), $('tab-bottlenecks'), $('tab-hosts')]) {
       tab.onkeydown = event => {
         if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
         event.preventDefault();
-        const next = tab.id === 'tab-queries' ? 'hosts' : 'queries';
+        const tabs = ['queries', 'bottlenecks', 'hosts'].filter(name => !$(`tab-${name}`).hidden);
+        const current = tabs.findIndex(name => `tab-${name}` === tab.id);
+        const next = tabs[(current + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
         selectTab(next);
         $(`tab-${next}`).focus();
       };
