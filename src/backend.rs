@@ -83,6 +83,14 @@ pub trait DatabaseBackend: Send + Sync {
         sort: QuerySort,
         range: MinuteRange,
     ) -> BackendFuture<'a, Vec<QueryStats>>;
+    /// Add optional metrics to an already paginated result. A backend may
+    /// leave rows unchanged when the corresponding statistics are unavailable.
+    fn enrich_query_stats<'a>(
+        &'a self,
+        rows: Vec<QueryStats>,
+    ) -> BackendFuture<'a, Vec<QueryStats>> {
+        Box::pin(async move { Ok(rows) })
+    }
     fn host_stats<'a>(&'a self, filter: &'a HostFilter) -> BackendFuture<'a, Vec<HostStats>>;
     fn recent_statements(&self, limit: u32) -> BackendFuture<'_, Vec<RecentStatement>>;
 

@@ -200,6 +200,60 @@ impl DatabaseBackend for MySqlBackend {
         })
     }
 
+    fn enrich_query_stats<'a>(
+        &'a self,
+        mut rows: Vec<QueryStats>,
+    ) -> BackendFuture<'a, Vec<QueryStats>> {
+        Box::pin(async move {
+            // The general log provides the displayed call count and query key.
+            // Performance Schema provides separate server-lifetime actuals.
+            let keys: Vec<_> = rows.iter().map(|row| row.key.clone()).collect();
+            let samples = self.general_log.sample_sqls(&keys).await;
+            for (row, sample) in rows.iter_mut().zip(samples) {
+                let Some(namespace) = row.namespace.as_deref() else {
+                    continue;
+                };
+                let Some((_, sql)) = sample else {
+                    continue;
+                };
+                let metric: Result<Option<(u64, u64, u64, u64, u64, u64, u64)>, sqlx::Error> =
+                    sqlx::query_as(
+                        "SELECT COUNT_STAR, SUM_TIMER_WAIT, MAX_TIMER_WAIT, SUM_ROWS_EXAMINED, \
+                     SUM_ROWS_SENT, SUM_NO_INDEX_USED, SUM_NO_GOOD_INDEX_USED \
+                     FROM performance_schema.events_statements_summary_by_digest \
+                     WHERE SCHEMA_NAME = ? AND DIGEST = STATEMENT_DIGEST(?) LIMIT 1",
+                    )
+                    .bind(namespace)
+                    .bind(sql)
+                    .fetch_optional(&self.pool)
+                    .await;
+                match metric {
+                    Ok(Some((
+                        calls,
+                        picoseconds,
+                        max_picoseconds,
+                        examined,
+                        sent,
+                        no_index,
+                        no_good_index,
+                    ))) if calls > 0 => {
+                        row.total_time_ms = Some(picoseconds as f64 / 1_000_000_000.0);
+                        row.mean_time_ms =
+                            Some(picoseconds as f64 / calls as f64 / 1_000_000_000.0);
+                        row.max_time_ms = Some(max_picoseconds as f64 / 1_000_000_000.0);
+                        row.rows_examined = Some(examined);
+                        row.rows_sent = Some(sent);
+                        row.no_index_used = Some(no_index);
+                        row.no_good_index_used = Some(no_good_index);
+                    }
+                    Err(error) if is_permission_error(&error) => break,
+                    _ => {}
+                }
+            }
+            Ok(rows)
+        })
+    }
+
     fn host_stats<'a>(&'a self, filter: &'a HostFilter) -> BackendFuture<'a, Vec<HostStats>> {
         Box::pin(async move { Ok(self.general_log.host_stats(filter).await) })
     }
@@ -230,6 +284,10 @@ impl DatabaseBackend for MySqlBackend {
                 .await)
         })
     }
+}
+
+fn is_permission_error(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some("1142"))
 }
 
 fn traditional_explain_row(row: &sqlx::mysql::MySqlRow) -> Result<Vec<String>, sqlx::Error> {

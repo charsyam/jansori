@@ -259,7 +259,9 @@ impl CollectorState {
                 calls,
                 total_time_ms: None,
                 mean_time_ms: None,
+                max_time_ms: None,
                 rows_examined: None,
+                rows_sent: None,
                 no_index_used: None,
                 no_good_index_used: None,
             })
@@ -767,6 +769,11 @@ impl GeneralLogCollector {
 
     pub async fn sample_sql(&self, key: &QueryKey) -> Option<(Option<String>, String)> {
         self.state.lock().await.sample_sql(key)
+    }
+
+    pub async fn sample_sqls(&self, keys: &[QueryKey]) -> Vec<Option<(Option<String>, String)>> {
+        let state = self.state.lock().await;
+        keys.iter().map(|key| state.sample_sql(key)).collect()
     }
 
     pub async fn timeline(

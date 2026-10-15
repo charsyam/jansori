@@ -152,6 +152,13 @@ async fn queries(
         params.offset.unwrap_or(0),
     )
     .await?;
+    let rows = if selected_range(params.from, params.to, params.window.as_deref())?.is_none()
+        && params.host.is_none()
+    {
+        state.backend.enrich_query_stats(rows).await?
+    } else {
+        rows
+    };
     Ok(Json(rows))
 }
 
@@ -169,6 +176,13 @@ async fn query_page(
         .skip(offset as usize)
         .take(page_limit as usize)
         .collect();
+    let items = if selected_range(params.from, params.to, params.window.as_deref())?.is_none()
+        && params.host.is_none()
+    {
+        state.backend.enrich_query_stats(items).await?
+    } else {
+        items
+    };
     Ok(Json(QueryPage {
         items,
         total,

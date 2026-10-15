@@ -93,7 +93,9 @@ pub struct QueryStats {
     /// `None` when the collection source does not record execution duration.
     pub total_time_ms: Option<f64>,
     pub mean_time_ms: Option<f64>,
+    pub max_time_ms: Option<f64>,
     pub rows_examined: Option<u64>,
+    pub rows_sent: Option<u64>,
     /// MySQL-only metric. `None` means unavailable, not zero.
     pub no_index_used: Option<u64>,
     /// MySQL-only metric. `None` means unavailable, not zero.

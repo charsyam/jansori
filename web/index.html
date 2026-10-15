@@ -91,7 +91,7 @@
     <div class="muted">기간은 최근 7일까지 선택할 수 있습니다. 1시간 이상 그래프의 막대를 클릭하면 해당 구간으로 좁힙니다.</div>
     <div class="row"><input id="query-search" placeholder="SQL 텍스트 검색"><input id="query-host" placeholder="호스트 필터 (MySQL)"><select id="query-sort"><option value="calls">호출 수</option><option value="total_time">총 실행 시간</option><option value="mean_time">평균 실행 시간</option></select><button id="query-refresh">조회</button></div>
     <div id="query-message" class="muted">쿼리를 클릭하면 바로 아래에 실행 계획이 표시됩니다.</div>
-    <div class="scroll"><table><thead><tr><th>DB</th><th>쿼리</th><th>호출 수</th><th>총 시간 (ms)</th><th>평균 시간 (ms)</th><th id="estimated-rows-heading">예상 행</th><th>예상 비용</th><th>출처</th></tr></thead><tbody id="queries"></tbody></table></div>
+    <div class="scroll"><table><thead><tr><th>DB</th><th>쿼리</th><th>호출 수</th><th>총 시간 (ms)</th><th>평균 시간 (ms)</th><th id="examined-rows-heading">실제 검사 행</th><th id="estimated-rows-heading">예상 행</th><th>예상 비용</th><th>출처</th></tr></thead><tbody id="queries"></tbody></table></div>
     <div class="row" style="align-items:center; margin-top:12px">
       <label>페이지당 <select id="query-page-size"><option value="10" selected>10개</option><option value="25">25개</option><option value="50">50개</option><option value="100">100개</option></select></label>
       <button id="query-prev" type="button">이전</button><span id="query-page-info" class="muted">1페이지</span><button id="query-next" type="button">다음</button>
@@ -151,6 +151,7 @@
       }
       for (const option of $('query-sort').options) option.disabled = databaseKind === 'MySql' && option.value !== 'calls';
       $('estimated-rows-heading').textContent = databaseKind === 'MySql' ? '접근 단계 예상 행 합' : '예상 결과 행';
+      $('examined-rows-heading').title = databaseKind === 'MySql' ? 'Performance Schema의 서버 누적 검사 행 수입니다. 전체 누적 화면에서만 표시합니다.' : '수집원이 실제 검사 행 수를 제공할 때 표시합니다.';
       $('estimated-rows-heading').title = databaseKind === 'MySql'
         ? '각 테이블 접근의 rows_examined_per_scan 합입니다. 중첩 루프의 반복 횟수는 반영하지 않습니다.'
         : '최상위 계획 노드가 반환할 것으로 예상한 행 수입니다.';
@@ -298,7 +299,10 @@
         pageTotalExact = page.total_is_exact;
         const totalText = `${pageTotal.toLocaleString()}${pageTotalExact ? '' : ' 이상'}`;
         const period = activeRange ? '직접 지정한 기간' : activeWindow === 'all' ? '전체 누적' : `최근 ${windowLabels[activeWindow]}`;
-        $('query-message').textContent = `총 ${totalText}개 쿼리 · ${period}${activeWindow === 'all' && !activeRange ? '' : ' · Jansori 실행 이후 관측'} · 클릭하면 실행 계획 표시`;
+        const actualNote = databaseKind === 'MySql' && activeWindow === 'all' && !activeRange && !$('query-host').value && page.items.some(row => row.total_time_ms != null)
+          ? ' · 호출 수는 Jansori 실행 이후, 실제 시간·검사 행은 MySQL 서버 누적'
+          : '';
+        $('query-message').textContent = `총 ${totalText}개 쿼리 · ${period}${activeWindow === 'all' && !activeRange ? '' : ' · Jansori 실행 이후 관측'}${actualNote} · 클릭하면 실행 계획 표시`;
         $('query-page-info').textContent = `${pageIndex + 1} / ${Math.max(1, Math.ceil(pageTotal / pageSize))}페이지`;
         $('query-prev').disabled = pageIndex === 0;
         $('query-next').disabled = (pageIndex + 1) * pageSize >= pageTotal;
@@ -461,17 +465,23 @@
           tr.onclick = () => selectQuery(row);
           const plan = planResults.get(row.key);
           const estimateText = metric => !/^select\s/i.test(row.statement_text.trim()) ? '정보 없음' : planResults.has(row.key) ? metric(plan) : '조회 중…';
-          tr.append(cell(row.namespace), sql, cell(row.calls), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(estimateText(estimatedRows)), cell(estimateText(estimatedCost)), cell(row.source));
+          tr.append(cell(row.namespace), sql, cell(row.calls), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(row.rows_examined == null ? '정보 없음' : Number(row.rows_examined).toLocaleString()), cell(estimateText(estimatedRows)), cell(estimateText(estimatedCost)), cell(row.source === 'MySqlGeneralLog' && row.total_time_ms != null ? '일반 로그 + 성능 통계' : row.source));
           $('queries').append(tr);
           if (row.key === selectedKey) {
             const detail = document.createElement('tr');
             detail.className = 'plan-detail';
             const td = document.createElement('td');
-            td.colSpan = 8;
+            td.colSpan = 9;
+            if (row.max_time_ms != null) {
+              const actual = document.createElement('p');
+              actual.className = 'muted';
+              actual.textContent = `서버 누적 실제 통계 · 최대 실행 ${ms(row.max_time_ms)} ms · 반환 행 ${Number(row.rows_sent).toLocaleString()} · 인덱스 미사용 ${Number(row.no_index_used).toLocaleString()}회 · 적절한 인덱스 없음 ${Number(row.no_good_index_used).toLocaleString()}회`;
+              td.append(actual);
+            }
             if (selectedLoading) {
-              td.textContent = '실행 계획 조회 중…';
+              td.append(document.createTextNode('실행 계획 조회 중…'));
             } else if (selectedError) {
-              td.textContent = selectedError;
+              td.append(document.createTextNode(selectedError));
               td.className = 'error';
             } else if (selectedPlan) {
               const title = document.createElement('strong');
