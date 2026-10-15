@@ -1,12 +1,12 @@
 //! MySQL implementation of the common backend contract.
 
-use sqlx::{AssertSqlSafe, MySqlPool};
+use sqlx::{AssertSqlSafe, MySqlPool, Row};
 
 use crate::backend::{BackendError, BackendErrorKind, BackendFuture, DatabaseBackend};
 use crate::model::{
-    AccessKind, Capabilities, Capability, DatabaseInfo, DatabaseKind, ExplainPlan, ExplainRequest,
-    HostFilter, HostStats, PlanNode, QueryFilter, QueryKey, QuerySort, QueryStats, RecentStatement,
-    Timeline,
+    AccessKind, Capabilities, Capability, DatabaseInfo, DatabaseKind, ExplainOutput, ExplainPlan,
+    ExplainRequest, HostFilter, HostStats, PlanNode, QueryFilter, QueryKey, QuerySort, QueryStats,
+    RecentStatement, Timeline,
 };
 
 use super::general_log::GeneralLogCollector;
@@ -104,23 +104,54 @@ impl DatabaseBackend for MySqlBackend {
                     .await
                     .map_err(query_error)?;
             }
-            let result: Result<(String,), sqlx::Error> =
-                // A statement cannot be bound as a value. Only one SELECT is
-                // accepted above; deployment must also use a read-only account.
-                sqlx::query_as(AssertSqlSafe(format!("EXPLAIN FORMAT=JSON {sql}")))
-                    .fetch_one(&mut *connection)
-                    .await;
+            // A statement cannot be bound as a value. Only one SELECT is
+            // accepted above; deployment must also use a read-only account.
+            let result: Result<_, sqlx::Error> = async {
+                let (raw_json,): (String,) =
+                    sqlx::query_as(AssertSqlSafe(format!("EXPLAIN FORMAT=JSON {sql}")))
+                        .fetch_one(&mut *connection)
+                        .await?;
+                let rows = sqlx::query(AssertSqlSafe(format!("EXPLAIN {sql}")))
+                    .fetch_all(&mut *connection)
+                    .await?;
+                let rows = rows
+                    .iter()
+                    .map(traditional_explain_row)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((raw_json, rows))
+            }
+            .await;
             // A changed default database must never leak to another pool borrower.
             if request.namespace.is_some() {
                 connection.close().await.map_err(query_error)?;
             }
-            let (raw_json,) = result.map_err(query_error)?;
+            let (raw_json, rows) = result.map_err(query_error)?;
             let value: serde_json::Value = serde_json::from_str(&raw_json).map_err(json_error)?;
             Ok(ExplainPlan {
                 database: DatabaseKind::MySql,
                 generic: false,
                 root: plan_node(&value),
                 raw_json,
+                raw_explain: ExplainOutput {
+                    columns: [
+                        "id",
+                        "select_type",
+                        "table",
+                        "partitions",
+                        "type",
+                        "possible_keys",
+                        "key",
+                        "key_len",
+                        "ref",
+                        "rows",
+                        "filtered",
+                        "Extra",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                    rows,
+                },
             })
         })
     }
@@ -169,6 +200,31 @@ impl DatabaseBackend for MySqlBackend {
     ) -> BackendFuture<'a, Timeline> {
         Box::pin(async move { Ok(self.general_log.timeline_range(query_key, range).await) })
     }
+}
+
+fn traditional_explain_row(row: &sqlx::mysql::MySqlRow) -> Result<Vec<String>, sqlx::Error> {
+    let text = |name| -> Result<String, sqlx::Error> {
+        Ok(row
+            .try_get::<Option<String>, _>(name)?
+            .unwrap_or_else(|| "NULL".into()))
+    };
+    Ok(vec![
+        row.try_get::<Option<u64>, _>("id")?
+            .map_or_else(|| "NULL".into(), |value| value.to_string()),
+        text("select_type")?,
+        text("table")?,
+        text("partitions")?,
+        text("type")?,
+        text("possible_keys")?,
+        text("key")?,
+        text("key_len")?,
+        text("ref")?,
+        row.try_get::<Option<u64>, _>("rows")?
+            .map_or_else(|| "NULL".into(), |value| value.to_string()),
+        row.try_get::<Option<f64>, _>("filtered")?
+            .map_or_else(|| "NULL".into(), |value| format!("{value:.2}")),
+        text("Extra")?,
+    ])
 }
 
 fn plan_node(value: &serde_json::Value) -> PlanNode {

@@ -7,8 +7,7 @@ use crate::model::{QueryKey, TimeBucket, Timeline, TimelineBasis};
 
 pub const RETAIN_MINUTES: u64 = 7 * 24 * 60;
 const MAX_TRACKED_QUERY_MINUTES: usize = 200_000;
-const RECENT_BUCKETS: u64 = 12;
-const RECENT_RETAIN_BUCKETS: u64 = 24;
+const RECENT_RETAIN_BUCKETS: u64 = 120;
 const MAX_RECENT_QUERY_ENTRIES: usize = 20_000;
 
 #[derive(Clone, Copy, Debug)]
@@ -16,6 +15,7 @@ pub struct MinuteRange {
     pub start: u64,
     pub end: u64,
     recent_end: Option<u64>,
+    recent_buckets: u64,
 }
 
 impl MinuteRange {
@@ -24,7 +24,8 @@ impl MinuteRange {
         Self {
             start: end.saturating_sub(minutes.clamp(1, RETAIN_MINUTES) - 1),
             end,
-            recent_end: (minutes == 1).then(current_epoch_five_seconds),
+            recent_end: (minutes <= 10).then(current_epoch_five_seconds),
+            recent_buckets: minutes.clamp(1, 10) * 12,
         }
     }
 
@@ -33,6 +34,7 @@ impl MinuteRange {
             start,
             end,
             recent_end: None,
+            recent_buckets: 0,
         }
     }
 }
@@ -167,7 +169,7 @@ impl TimelineStore {
     pub fn query_metric(&self, range: MinuteRange, key: &str) -> QueryMetric {
         let mut total = QueryMetric::default();
         if let Some(end) = range.recent_end {
-            for bucket in end.saturating_sub(RECENT_BUCKETS - 1)..=end {
+            for bucket in end.saturating_sub(range.recent_buckets - 1)..=end {
                 if let Some(value) = self
                     .recent_by_query
                     .get(&bucket)
@@ -212,16 +214,25 @@ impl TimelineStore {
         range: MinuteRange,
     ) -> Timeline {
         if let Some(end) = range.recent_end {
-            let buckets = (end.saturating_sub(RECENT_BUCKETS - 1)..=end)
+            let step = match range.recent_buckets {
+                0..=12 => 1,
+                13..=60 => 6,
+                _ => 12,
+            };
+            let start = end.saturating_sub(range.recent_buckets - 1);
+            let buckets = (start..=end)
+                .step_by(step as usize)
                 .map(|bucket| {
-                    let calls = match query_key {
-                        Some(key) => self
-                            .recent_by_query
-                            .get(&bucket)
-                            .and_then(|queries| queries.get(&key.0))
-                            .map_or(0, |metric| metric.calls),
-                        None => self.recent_totals.get(&bucket).copied().unwrap_or(0),
-                    };
+                    let calls = (bucket..=bucket.saturating_add(step - 1).min(end))
+                        .map(|part| match query_key {
+                            Some(key) => self
+                                .recent_by_query
+                                .get(&part)
+                                .and_then(|queries| queries.get(&key.0))
+                                .map_or(0, |metric| metric.calls),
+                            None => self.recent_totals.get(&part).copied().unwrap_or(0),
+                        })
+                        .sum();
                     TimeBucket {
                         start_epoch_seconds: bucket * 5,
                         calls,
@@ -230,7 +241,7 @@ impl TimelineStore {
                 .collect();
             return Timeline {
                 basis,
-                bucket_seconds: 5,
+                bucket_seconds: step * 5,
                 buckets,
             };
         }
@@ -273,13 +284,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn five_minute_window_excludes_older_calls_and_keeps_duration() {
+    fn minute_range_excludes_older_calls_and_keeps_duration() {
         let now = current_epoch_minute();
         let mut store = TimelineStore::default();
         store.record(now - 5, "a", 2, 2.5);
         store.record(now - 4, "a", 3, 4.0);
         store.record(now, "b", 1, 1.0);
-        let range = MinuteRange::recent(5);
+        let range = MinuteRange::between(now - 4, now);
         assert_eq!(store.query_metric(range, "a").calls, 3);
         assert_eq!(store.query_metric(range, "a").total_time_ms, 4.0);
         let series = store.series_range(TimelineBasis::ObservedByCollector, None, range);
@@ -326,6 +337,27 @@ mod tests {
                 .map(|bucket| bucket.calls)
                 .sum::<u64>(),
             4
+        );
+    }
+
+    #[test]
+    fn five_minute_window_keeps_calls_across_minute_boundary() {
+        let now = current_epoch_five_seconds();
+        let mut store = TimelineStore::default();
+        store.record_recent(now - 60, "a", 2, 2.0);
+        store.record_recent(now - 59, "a", 3, 4.0);
+        let range = MinuteRange::recent(5);
+        assert_eq!(store.query_metric(range, "a").calls, 3);
+        assert_eq!(store.query_metric(range, "a").total_time_ms, 4.0);
+        let series = store.series_range(TimelineBasis::ObservedByCollector, None, range);
+        assert_eq!(series.bucket_seconds, 30);
+        assert_eq!(
+            series
+                .buckets
+                .iter()
+                .map(|bucket| bucket.calls)
+                .sum::<u64>(),
+            3
         );
     }
 }

@@ -7,9 +7,9 @@ use tokio::sync::Mutex;
 
 use crate::backend::{BackendError, BackendErrorKind, BackendFuture, DatabaseBackend};
 use crate::model::{
-    AccessKind, Capabilities, Capability, DatabaseInfo, DatabaseKind, ExplainPlan, ExplainRequest,
-    HostFilter, HostStats, PlanNode, QueryFilter, QueryKey, QuerySort, QuerySource, QueryStats,
-    RecentStatement, Timeline, TimelineBasis,
+    AccessKind, Capabilities, Capability, DatabaseInfo, DatabaseKind, ExplainOutput, ExplainPlan,
+    ExplainRequest, HostFilter, HostStats, PlanNode, QueryFilter, QueryKey, QuerySort, QuerySource,
+    QueryStats, RecentStatement, Timeline, TimelineBasis,
 };
 use crate::timeline::{
     current_epoch_five_seconds, current_epoch_minute, MinuteRange, QueryMetric, TimelineStore,
@@ -206,6 +206,23 @@ impl DatabaseBackend for PostgresBackend {
                 .await
                 .map_err(query_error)?;
             let value: serde_json::Value = row.try_get(0).map_err(query_error)?;
+            let text_options = if generic {
+                "FORMAT TEXT, GENERIC_PLAN TRUE"
+            } else {
+                "FORMAT TEXT"
+            };
+            let text_rows = sqlx::raw_sql(AssertSqlSafe(format!("EXPLAIN ({text_options}) {sql}")))
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(query_error)?;
+            let text_rows = text_rows
+                .into_iter()
+                .map(|row| {
+                    row.try_get::<String, _>(0)
+                        .map(|line| vec![line])
+                        .map_err(query_error)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             transaction.rollback().await.map_err(query_error)?;
             let raw_json = value.to_string();
             let plan = value
@@ -220,6 +237,10 @@ impl DatabaseBackend for PostgresBackend {
                 generic,
                 root: plan_node(plan),
                 raw_json,
+                raw_explain: ExplainOutput {
+                    columns: vec!["QUERY PLAN".into()],
+                    rows: text_rows,
+                },
             })
         })
     }

@@ -163,4 +163,12 @@ pub struct ExplainPlan {
     pub root: PlanNode,
     /// Engine-native EXPLAIN FORMAT=JSON output, preserved for full detail.
     pub raw_json: String,
+    /// Engine-native EXPLAIN output presented as its original rows and columns.
+    pub raw_explain: ExplainOutput,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ExplainOutput {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
 }

@@ -42,6 +42,19 @@
     tr.query-row:hover, tr.query-row.selected { background: #eaf3fb; }
     tr.plan-detail td { background: #f8fbfd; border-left: 3px solid #175b9c; }
     tr.plan-detail details { margin-top: 10px; }
+    .copy-button { margin-top: 6px; padding: 4px 8px; font-size: .85rem; }
+    .index-assessment { margin: 10px 0; padding: 10px 12px; border-radius: 6px; background: #eef3f8; }
+    .index-assessment.used { background: #e8f5ec; color: #17613c; }
+    .index-assessment.unused { background: #fff0ec; color: #9b3326; }
+    .index-assessment.mixed { background: #fff5dc; color: #765400; }
+    .index-assessment p { margin: 5px 0 0; }
+    .index-table { margin-top: 8px; width: 100%; }
+    .index-table td { word-break: break-word; }
+    .index-table .yes { color: #17613c; font-weight: 700; }
+    .index-table .no { color: #9b3326; font-weight: 700; }
+    .raw-explain-table { margin-top: 8px; }
+    .raw-explain-table th, .raw-explain-table td { white-space: pre; }
+    .raw-explain-table.pg td { font-family: monospace; }
     .timeline { display: flex; align-items: end; gap: 3px; height: 150px; padding: 14px 0 24px; border-bottom: 1px solid #d9e0e6; }
     .timeline-bar { flex: 1; min-width: 8px; background: #5a9bd4; border-radius: 3px 3px 0 0; }
     .timeline-bar.clickable:hover { background: #175b9c; cursor: pointer; }
@@ -74,7 +87,7 @@
   <section class="panel">
     <h2>쿼리</h2>
     <div class="row"><label>직접 지정 시작 <input id="range-from" type="datetime-local" step="60"></label><label>끝 (해당 분 포함) <input id="range-to" type="datetime-local" step="60"></label><button id="range-apply">시간 적용</button><button id="range-clear">전체 누적으로 돌아가기</button></div>
-    <div class="muted">기간은 최근 7일까지 선택할 수 있습니다. 그래프의 막대를 클릭하면 해당 구간으로 좁힙니다.</div>
+    <div class="muted">기간은 최근 7일까지 선택할 수 있습니다. 1시간 이상 그래프의 막대를 클릭하면 해당 구간으로 좁힙니다.</div>
     <div class="row"><input id="query-search" placeholder="SQL 텍스트 검색"><input id="query-host" placeholder="호스트 필터 (MySQL)"><select id="query-sort"><option value="calls">호출 수</option><option value="total_time">총 실행 시간</option><option value="mean_time">평균 실행 시간</option></select><button id="query-refresh">조회</button></div>
     <div id="query-message" class="muted">쿼리를 클릭하면 바로 아래에 실행 계획이 표시됩니다.</div>
     <div class="scroll"><table><thead><tr><th>쿼리</th><th>호출 수</th><th>총 시간 (ms)</th><th>평균 시간 (ms)</th><th>출처</th></tr></thead><tbody id="queries"></tbody></table></div>
@@ -102,6 +115,7 @@
     let selectedPlan = null;
     let selectedError = null;
     let selectedLoading = false;
+    let rawExplainExpanded = false;
     let selectionRequest = 0;
     let timelineRequest = 0;
     let queryRequest = 0;
@@ -118,6 +132,7 @@
       selectedPlan = null;
       selectedError = null;
       selectedLoading = false;
+      rawExplainExpanded = false;
       selectionRequest++;
     }
     function refreshFirstPage() {
@@ -232,12 +247,143 @@
       visit(plan.root, 0);
       return lines.join('\n');
     }
+    function indexAssessment(plan) {
+      const rows = [];
+      const raw = JSON.parse(plan.raw_json);
+      if (plan.database === 'MySql') {
+        function visit(value) {
+          if (Array.isArray(value)) { value.forEach(visit); return; }
+          if (!value || typeof value !== 'object') return;
+          if (value.table) {
+            const table = value.table;
+            const access = table.access_type || '정보 없음';
+            const index = table.key || null;
+            rows.push({
+              relation: table.table_name || '해당 단계',
+              columns: Array.isArray(table.used_key_parts) ? table.used_key_parts.join(', ') : '',
+              usage: index ? 'yes' : access === 'ALL' ? 'no' : 'unknown',
+              index,
+              access: access === 'ALL' ? '테이블 전체 스캔 (ALL)' : access === 'index' ? '인덱스 전체 스캔 (index)' : access
+            });
+          }
+          Object.values(value).forEach(visit);
+        }
+        visit(raw);
+      } else if (plan.database === 'PostgreSql') {
+        function visit(node, relation) {
+          const name = node['Relation Name'] || relation || '해당 단계';
+          const access = node['Node Type'] || '정보 없음';
+          const index = node['Index Name'] || null;
+          const fullScan = access === 'Seq Scan' || access === 'Parallel Seq Scan';
+          const indexScan = Boolean(index) || access.includes('Index Scan');
+          if (node['Relation Name'] || indexScan) {
+            if (access !== 'Bitmap Heap Scan') rows.push({
+              relation: name,
+              columns: node['Index Cond'] || '',
+              usage: indexScan ? 'yes' : fullScan ? 'no' : 'unknown',
+              index,
+              access
+            });
+          }
+          for (const child of node.Plans || []) visit(child, name);
+        }
+        const root = raw[0]?.Plan;
+        if (root) visit(root, null);
+      }
+      const hasIndex = rows.some(row => row.usage === 'yes');
+      const hasScan = rows.some(row => row.usage === 'no');
+      const state = hasIndex && hasScan ? 'mixed' : hasIndex ? 'used' : hasScan ? 'unused' : 'unknown';
+      const label = { used: '인덱스 사용', unused: '인덱스 미사용', mixed: '인덱스 사용·전체 스캔 혼합', unknown: '인덱스 사용 여부 판단 불가' }[state];
+      return { state, label, rows };
+    }
+    function indexTable(assessment, database) {
+      const table = document.createElement('table');
+      table.className = 'index-table';
+      const head = document.createElement('thead');
+      const headings = document.createElement('tr');
+      for (const name of ['테이블', database === 'MySql' ? '인덱스 사용 컬럼' : '인덱스 조건', '인덱스 사용', '인덱스 이름', '접근 방식']) {
+        const th = document.createElement('th');
+        th.textContent = name;
+        headings.append(th);
+      }
+      head.append(headings);
+      const body = document.createElement('tbody');
+      for (const row of assessment.rows) {
+        const tr = document.createElement('tr');
+        const usage = cell({ yes: '예', no: '아니요', unknown: '확인 불가' }[row.usage]);
+        usage.className = row.usage === 'yes' ? 'yes' : row.usage === 'no' ? 'no' : '';
+        tr.append(cell(row.relation), cell(row.columns || '—'), usage, cell(row.index || '—'), cell(row.access));
+        body.append(tr);
+      }
+      if (!assessment.rows.length) {
+        const tr = document.createElement('tr');
+        const td = cell('EXPLAIN에 테이블 접근 단계가 없습니다.');
+        td.colSpan = 5;
+        tr.append(td);
+        body.append(tr);
+      }
+      table.append(head, body);
+      return table;
+    }
+    function rawExplainTable(output, database) {
+      const table = document.createElement('table');
+      table.className = `raw-explain-table ${database === 'PostgreSql' ? 'pg' : ''}`;
+      const head = document.createElement('thead');
+      const headings = document.createElement('tr');
+      for (const name of output.columns) {
+        const th = document.createElement('th');
+        th.textContent = name;
+        headings.append(th);
+      }
+      head.append(headings);
+      const body = document.createElement('tbody');
+      for (const values of output.rows) {
+        const tr = document.createElement('tr');
+        for (const value of values) tr.append(cell(value));
+        body.append(tr);
+      }
+      table.append(head, body);
+      return table;
+    }
+    async function copySql(value, button) {
+      try {
+        let copied = false;
+        if (navigator.clipboard?.writeText) {
+          try { await navigator.clipboard.writeText(value); copied = true; } catch (_) { /* try the fallback */ }
+        }
+        if (!copied) {
+          const input = document.createElement('textarea');
+          input.value = value;
+          input.style.position = 'fixed';
+          input.style.opacity = '0';
+          document.body.append(input);
+          try {
+            input.select();
+            copied = document.execCommand('copy');
+          } finally {
+            input.remove();
+          }
+        }
+        if (!copied) throw new Error('복사 실패');
+        button.textContent = '복사됨';
+      } catch (_) {
+        button.textContent = '복사 실패';
+      }
+      setTimeout(() => { if (button.isConnected) button.textContent = 'SQL 복사'; }, 2000);
+    }
     function renderQueries() {
       $('queries').replaceChildren();
       for (const row of queryRows) {
           const tr = document.createElement('tr');
           tr.className = 'query-row' + (row.key === selectedKey ? ' selected' : '');
           const sql = cell(row.statement_text); sql.className = 'sql';
+          const copy = document.createElement('button');
+          copy.type = 'button';
+          copy.className = 'copy-button';
+          copy.textContent = 'SQL 복사';
+          copy.setAttribute('aria-label', '이 쿼리의 SQL 복사');
+          copy.onclick = event => { event.stopPropagation(); copySql(row.statement_text, copy); };
+          sql.append(document.createElement('br'), copy);
           tr.title = '클릭하면 실행 계획을 조회';
           tr.onclick = () => selectQuery(row);
           tr.append(sql, cell(row.calls), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(row.source));
@@ -255,15 +401,33 @@
             } else if (selectedPlan) {
               const title = document.createElement('strong');
               title.textContent = selectedPlan.generic ? '범용 추정 계획 · 실제 값에 따라 달라질 수 있음' : '현재 추정 계획';
+              const assessment = indexAssessment(selectedPlan);
+              const indexBox = document.createElement('div');
+              indexBox.className = `index-assessment ${assessment.state}`;
+              const indexLabel = document.createElement('strong');
+              indexLabel.textContent = assessment.label;
+              const indexNote = document.createElement('p');
+              indexNote.textContent = '현재 EXPLAIN의 예상 접근 경로입니다. 실제 실행 경로는 값과 통계에 따라 달라질 수 있습니다.';
+              indexBox.append(indexLabel, indexNote);
+              const indexColumnsNote = document.createElement('p');
+              indexColumnsNote.className = 'muted';
+              indexColumnsNote.textContent = selectedPlan.database === 'MySql'
+                ? '사용 컬럼은 EXPLAIN의 used_key_parts입니다. —는 해당 정보가 없다는 뜻입니다.'
+                : '인덱스 조건은 EXPLAIN의 Index Cond입니다. —는 해당 정보가 없다는 뜻입니다.';
               const summary = document.createElement('pre');
               summary.textContent = planText(selectedPlan);
               const details = document.createElement('details');
+              details.open = rawExplainExpanded;
+              details.addEventListener('toggle', () => {
+                if (details.isConnected) rawExplainExpanded = details.open;
+              });
               const label = document.createElement('summary');
-              label.textContent = '원본 JSON 보기';
-              const raw = document.createElement('pre');
-              raw.textContent = JSON.stringify(JSON.parse(selectedPlan.raw_json), null, 2);
+              label.textContent = '원본 EXPLAIN 보기';
+              const raw = document.createElement('div');
+              raw.className = 'scroll';
+              raw.append(rawExplainTable(selectedPlan.raw_explain, selectedPlan.database));
               details.append(label, raw);
-              td.append(title, summary, details);
+              td.append(title, indexBox, indexTable(assessment, selectedPlan.database), indexColumnsNote, summary, details);
             }
             detail.append(td);
             $('queries').append(detail);
@@ -295,7 +459,7 @@
           bar.style.height = `${Math.max(bucket.calls ? 4 : 1, (bucket.calls / maximum) * 100)}%`;
           bar.style.opacity = bucket.calls ? '1' : '0.25';
           bar.title = `${new Date(bucket.start_epoch_seconds * 1000).toLocaleString()} · ${bucket.calls}회`;
-          if (timeline.bucket_seconds >= 60) {
+          if (timeline.bucket_seconds >= 60 && (activeRange || !['1m', '5m', '10m'].includes(activeWindow))) {
             bar.classList.add('clickable');
             bar.onclick = () => {
               $('range-from').value = localMinute(bucket.start_epoch_seconds);
@@ -341,6 +505,7 @@
     async function selectQuery(row) {
       if (selectedKey === row.key) {
         selectedKey = null;
+        rawExplainExpanded = false;
         selectionRequest++;
         renderQueries();
         refreshTimeline();
@@ -350,6 +515,7 @@
       selectedPlan = null;
       selectedError = null;
       selectedLoading = true;
+      rawExplainExpanded = false;
       const request = ++selectionRequest;
       renderQueries();
       refreshTimeline();
