@@ -72,6 +72,14 @@
   <div class="row presets" role="group" aria-label="조회 기간">
     <button data-window="all" class="active">전체 누적</button><button data-window="1m">1분</button><button data-window="5m">5분</button><button data-window="10m">10분</button><button data-window="1h">1시간</button><button data-window="3h">3시간</button><button data-window="1d">1일</button><button data-window="3d">3일</button><button data-window="7d">7일</button>
   </div>
+  <section id="timeline-panel" class="panel">
+    <h2>기간별 호출</h2>
+    <div id="timeline-title">전체 쿼리 · 최근 7일 호출 추이</div>
+    <p id="timeline-basis" class="muted"></p>
+    <div id="timeline-chart" class="timeline" role="img" aria-label="기간별 쿼리 호출 수"></div>
+    <div id="timeline-labels" class="timeline-labels muted"></div>
+    <div id="timeline-message" class="muted"></div>
+  </section>
   <nav class="tabs" role="tablist" aria-label="통계 종류">
     <button id="tab-queries" role="tab" aria-controls="queries-panel" aria-selected="true">쿼리</button>
     <button id="tab-bottlenecks" role="tab" aria-controls="bottlenecks-panel" aria-selected="false" tabindex="-1">병목</button>
@@ -101,14 +109,6 @@
   <div id="hosts-panel" role="tabpanel" aria-labelledby="tab-hosts" hidden>
     <section class="panel"><h2>호스트</h2><p class="muted">현재 접속과 전체 누적 값입니다. 시간 범위 필터는 쿼리 통계에 적용됩니다.</p><div class="scroll"><table><thead><tr><th>호스트</th><th>현재 접속</th><th>수집된 쿼리</th></tr></thead><tbody id="hosts"></tbody></table></div></section>
   </div>
-  <section id="timeline-panel" class="panel">
-    <h2>기간별 호출</h2>
-    <div id="timeline-title">전체 쿼리 · 최근 7일 호출 추이</div>
-    <p id="timeline-basis" class="muted"></p>
-    <div id="timeline-chart" class="timeline" role="img" aria-label="기간별 쿼리 호출 수"></div>
-    <div id="timeline-labels" class="timeline-labels muted"></div>
-    <div id="timeline-message" class="muted"></div>
-  </section>
   <script>
     const $ = id => document.getElementById(id);
     const capabilityLabels = {
