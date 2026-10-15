@@ -5,10 +5,10 @@
 //! If more than `max_batch_rows` rows accumulate between polls, collection stops
 //! with an error instead of silently dropping a partial batch.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use sha2::{Digest, Sha256};
-use sqlx::{MySqlPool, Row};
+use sqlx::{AssertSqlSafe, MySqlPool, Row};
 use tokio::sync::Mutex;
 
 use crate::backend::{BackendError, BackendErrorKind};
@@ -67,6 +67,32 @@ struct CollectorState {
 }
 
 impl CollectorState {
+    fn update_thread_database(&mut self, thread_id: u64, command: &str, argument: &str) -> bool {
+        match command {
+            "Connect" | "Change user" => {
+                self.thread_databases
+                    .insert(thread_id, connect_database(argument));
+                true
+            }
+            "Init DB" => {
+                self.thread_databases
+                    .insert(thread_id, Some(argument.trim().to_owned()));
+                true
+            }
+            "Quit" => {
+                self.thread_databases.remove(&thread_id);
+                true
+            }
+            "Query" | "Execute" => {
+                if let Some(database) = use_database(argument) {
+                    self.thread_databases.insert(thread_id, Some(database));
+                }
+                false
+            }
+            _ => true,
+        }
+    }
+
     fn ingest(&mut self, rows: Vec<LogRow>) -> usize {
         let mut timestamp = self.watermark.clone();
         let mut seen_this_poll: HashMap<LogIdentity, u32> = HashMap::new();
@@ -101,26 +127,12 @@ impl CollectorState {
             }
 
             let thread_id = row.identity.thread_id;
-            match row.identity.command_type.as_str() {
-                "Connect" | "Change user" => {
-                    self.thread_databases
-                        .insert(thread_id, connect_database(&row.identity.argument));
-                    continue;
-                }
-                "Init DB" => {
-                    self.thread_databases
-                        .insert(thread_id, Some(row.identity.argument.trim().to_owned()));
-                    continue;
-                }
-                "Quit" => {
-                    self.thread_databases.remove(&thread_id);
-                    continue;
-                }
-                "Query" | "Execute" => {}
-                _ => continue,
-            }
-            if let Some(database) = use_database(&row.identity.argument) {
-                self.thread_databases.insert(thread_id, Some(database));
+            if self.update_thread_database(
+                thread_id,
+                &row.identity.command_type,
+                &row.identity.argument,
+            ) {
+                continue;
             }
             let namespace = self.thread_databases.get(&thread_id).cloned().flatten();
 
@@ -660,6 +672,56 @@ impl GeneralLogCollector {
                 })
             })
             .collect::<Result<Vec<_>, BackendError>>()?;
+        let mut initialized_here = HashSet::new();
+        let mut unknown_threads = HashSet::new();
+        for row in &parsed {
+            let id = row.identity.thread_id;
+            match row.identity.command_type.as_str() {
+                "Connect" | "Change user" | "Init DB" => {
+                    initialized_here.insert(id);
+                }
+                "Quit" => {
+                    initialized_here.remove(&id);
+                }
+                "Query" | "Execute"
+                    if !state.thread_databases.contains_key(&id)
+                        && !initialized_here.contains(&id)
+                        && !state.own_threads.contains(&id) =>
+                {
+                    unknown_threads.insert(id);
+                }
+                _ => {}
+            }
+        }
+        if !unknown_threads.is_empty() {
+            // Older connections have no Connect record in the incremental batch.
+            // Read their database changes once from the existing log before ingesting.
+            let placeholders = vec!["?"; unknown_threads.len()].join(",");
+            let sql = format!(
+                "SELECT thread_id, command_type, LEFT(CAST(argument AS CHAR), 8192) AS argument \
+                 FROM mysql.general_log WHERE event_time < ? AND thread_id IN ({placeholders}) \
+                 AND (command_type IN ('Connect', 'Change user', 'Init DB', 'Quit') \
+                      OR (command_type IN ('Query', 'Execute') AND UPPER(LEFT(CAST(argument AS CHAR), 4)) = 'USE ')) \
+                 ORDER BY event_time, thread_id"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql)).bind(&state.watermark);
+            for id in &unknown_threads {
+                query = query.bind(id);
+            }
+            let history = query
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(query_error)?;
+            for row in history {
+                let id: u64 = row.try_get("thread_id").map_err(query_error)?;
+                let command: String = row.try_get("command_type").map_err(query_error)?;
+                let argument: String = row.try_get("argument").map_err(query_error)?;
+                state.update_thread_database(id, &command, &argument);
+            }
+            for id in unknown_threads {
+                state.thread_databases.entry(id).or_insert(None);
+            }
+        }
         Ok(state.ingest(parsed))
     }
 
