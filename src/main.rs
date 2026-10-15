@@ -133,6 +133,10 @@ async fn info(State(state): State<AppState>) -> ApiResult<jansori::model::Databa
     Ok(Json(state.backend.info().await?))
 }
 
+async fn databases(State(state): State<AppState>) -> ApiResult<Vec<String>> {
+    Ok(Json(state.backend.databases().await?))
+}
+
 async fn capabilities(State(state): State<AppState>) -> ApiResult<jansori::model::Capabilities> {
     Ok(Json(state.backend.capabilities().await?))
 }
@@ -213,6 +217,7 @@ async fn hosts(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Vec<jansori::model::HostStats>> {
     let filter = HostFilter {
+        namespace: params.namespace,
         text_contains: params.search,
         limit: limit(params.limit),
         offset: params.offset.unwrap_or(0),
@@ -232,6 +237,7 @@ async fn recent(
 #[derive(Default, Deserialize)]
 struct TimelineParams {
     query_key: Option<String>,
+    namespace: Option<String>,
     hours: Option<u32>,
     from: Option<u64>,
     to: Option<u64>,
@@ -245,12 +251,19 @@ async fn timeline(
     let key = params.query_key.map(QueryKey);
     match selected_range(params.from, params.to, params.window.as_deref())? {
         Some(range) => Ok(Json(
-            state.backend.timeline_range(key.as_ref(), range).await?,
+            state
+                .backend
+                .timeline_range(key.as_ref(), params.namespace.as_deref(), range)
+                .await?,
         )),
         None => Ok(Json(
             state
                 .backend
-                .timeline(key.as_ref(), params.hours.unwrap_or(24).clamp(1, 168))
+                .timeline(
+                    key.as_ref(),
+                    params.namespace.as_deref(),
+                    params.hours.unwrap_or(24).clamp(1, 168),
+                )
                 .await?,
         )),
     }
@@ -357,6 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/info", get(info))
+        .route("/api/databases", get(databases))
         .route("/api/capabilities", get(capabilities))
         .route("/api/queries", get(queries))
         .route("/api/queries/page", get(query_page))

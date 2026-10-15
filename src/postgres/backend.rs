@@ -35,6 +35,22 @@ impl PostgresBackend {
         }
     }
 
+    async fn database_timeline_key(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Option<QueryKey>, BackendError> {
+        let Some(database) = namespace else {
+            return Ok(None);
+        };
+        let id: Option<i64> =
+            sqlx::query_scalar("SELECT oid::bigint FROM pg_database WHERE datname = $1")
+                .bind(database)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(query_error)?;
+        Ok(Some(QueryKey(format!("db:{}", id.unwrap_or(-1)))))
+    }
+
     async fn statement_schema(&self) -> Result<Option<String>, BackendError> {
         sqlx::query_scalar(
             "SELECT n.nspname FROM pg_extension e \
@@ -85,6 +101,17 @@ impl PostgresBackend {
                 state
                     .store
                     .record_recent(recent_bucket, key, delta, time_delta);
+                if let Some(dbid) = key.split(':').next() {
+                    state
+                        .store
+                        .record_scoped(minute, &format!("db:{dbid}"), delta);
+                    state.store.record_recent_scoped(
+                        recent_bucket,
+                        &format!("db:{dbid}"),
+                        delta,
+                        time_delta,
+                    );
+                }
                 added += delta;
             }
         }
@@ -113,6 +140,47 @@ fn quote_identifier(value: &str) -> String {
 }
 
 impl DatabaseBackend for PostgresBackend {
+    fn databases(&self) -> BackendFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            sqlx::query_scalar(
+                "SELECT datname FROM pg_database WHERE datallowconn AND has_database_privilege(oid, 'CONNECT') ORDER BY datname",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(query_error)
+        })
+    }
+
+    fn explain_query<'a>(&'a self, key: &'a QueryKey) -> BackendFuture<'a, ExplainPlan> {
+        Box::pin(async move {
+            let current: String = sqlx::query_scalar("SELECT current_database()")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(query_error)?;
+            let filter = QueryFilter {
+                limit: 10_000,
+                ..QueryFilter::default()
+            };
+            let row = self
+                .query_stats(&filter, QuerySort::Calls)
+                .await?
+                .into_iter()
+                .find(|row| &row.key == key)
+                .ok_or_else(|| BackendError {
+                    kind: BackendErrorKind::InvalidRequest,
+                    message: "수집된 쿼리를 찾을 수 없습니다".into(),
+                })?;
+            if row.namespace.as_deref() != Some(&current) {
+                return Err(unsupported("다른 PostgreSQL 데이터베이스의 실행 계획은 해당 데이터베이스에 직접 연결해야 조회할 수 있습니다"));
+            }
+            self.explain(&ExplainRequest {
+                namespace: None,
+                sql: row.statement_text,
+            })
+            .await
+        })
+    }
+
     fn info(&self) -> BackendFuture<'_, DatabaseInfo> {
         Box::pin(async move {
             let (version,): (String,) = sqlx::query_as("SELECT version()")
@@ -251,9 +319,9 @@ impl DatabaseBackend for PostgresBackend {
         sort: QuerySort,
     ) -> BackendFuture<'a, Vec<QueryStats>> {
         Box::pin(async move {
-            if filter.namespace.is_some() || filter.host.is_some() {
+            if filter.host.is_some() {
                 return Err(unsupported(
-                    "pg_stat_statements는 스키마 또는 호스트별 쿼리 집계를 제공하지 않습니다",
+                    "pg_stat_statements는 호스트별 쿼리 집계를 제공하지 않습니다",
                 ));
             }
             if sort == QuerySort::RowsExamined {
@@ -266,37 +334,39 @@ impl DatabaseBackend for PostgresBackend {
                 .await?
                 .ok_or_else(|| unsupported("pg_stat_statements 확장이 필요합니다"))?;
             let order = match sort {
-                QuerySort::Calls => "calls",
-                QuerySort::TotalTime => "total_exec_time",
-                QuerySort::MeanTime => "mean_exec_time",
+                QuerySort::Calls => "s.calls",
+                QuerySort::TotalTime => "s.total_exec_time",
+                QuerySort::MeanTime => "s.mean_exec_time",
                 QuerySort::RowsExamined => unreachable!(),
             };
             let sql = format!(
-                "SELECT dbid::bigint, userid::bigint, queryid, \
-                 CASE WHEN query ~* '^[[:space:]]*(CREATE[[:space:]]+(USER|ROLE)|ALTER[[:space:]]+(USER|ROLE)|SET[[:space:]]|GRANT[[:space:]]|REVOKE[[:space:]])' \
-                      THEN '[administrative statement redacted]' ELSE query END, calls, \
-                 total_exec_time, mean_exec_time \
-                 FROM {}.pg_stat_statements \
-                 WHERE userid <> (SELECT oid FROM pg_roles WHERE rolname = current_user) \
-                 AND ($1::text IS NULL OR query ILIKE '%' || $1 || '%') \
+                "SELECT s.dbid::bigint, s.userid::bigint, s.queryid, d.datname, \
+                 CASE WHEN s.query ~* '^[[:space:]]*(CREATE[[:space:]]+(USER|ROLE)|ALTER[[:space:]]+(USER|ROLE)|SET[[:space:]]|GRANT[[:space:]]|REVOKE[[:space:]])' \
+                      THEN '[administrative statement redacted]' ELSE s.query END, s.calls, \
+                 s.total_exec_time, s.mean_exec_time \
+                 FROM {}.pg_stat_statements s JOIN pg_database d ON d.oid = s.dbid \
+                 WHERE s.userid <> (SELECT oid FROM pg_roles WHERE rolname = current_user) \
+                 AND ($1::text IS NULL OR s.query ILIKE '%' || $1 || '%') \
+                 AND ($4::text IS NULL OR d.datname = $4) \
                  ORDER BY {order} DESC LIMIT $2 OFFSET $3",
                 quote_identifier(&schema)
             );
-            let rows: Vec<(i64, i64, Option<i64>, String, i64, f64, f64)> =
+            let rows: Vec<(i64, i64, Option<i64>, String, String, i64, f64, f64)> =
                 sqlx::query_as(AssertSqlSafe(sql))
                     .bind(&filter.text_contains)
                     .bind(filter.limit as i64)
                     .bind(filter.offset as i64)
+                    .bind(&filter.namespace)
                     .fetch_all(&self.pool)
                     .await
                     .map_err(query_error)?;
             Ok(rows
                 .into_iter()
                 .map(
-                    |(dbid, userid, queryid, query, calls, total, mean)| QueryStats {
+                    |(dbid, userid, queryid, database, query, calls, total, mean)| QueryStats {
                         source: QuerySource::PostgreSqlStatStatements,
                         key: QueryKey(format!("{dbid}:{userid}:{queryid:?}")),
-                        namespace: None,
+                        namespace: Some(database),
                         statement_text: query,
                         calls: calls.max(0) as u64,
                         total_time_ms: Some(total),
@@ -364,12 +434,14 @@ impl DatabaseBackend for PostgresBackend {
                 "SELECT client_addr::text, COUNT(*) FROM pg_stat_activity \
                  WHERE client_addr IS NOT NULL \
                  AND ($1::text IS NULL OR client_addr::text LIKE '%' || $1 || '%') \
+                 AND ($4::text IS NULL OR datname = $4) \
                  GROUP BY client_addr ORDER BY COUNT(*) DESC, client_addr::text \
                  LIMIT $2 OFFSET $3",
             )
             .bind(&filter.text_contains)
             .bind(filter.limit as i64)
             .bind(filter.offset as i64)
+            .bind(&filter.namespace)
             .fetch_all(&self.pool)
             .await
             .map_err(query_error)?;
@@ -396,12 +468,18 @@ impl DatabaseBackend for PostgresBackend {
     fn timeline<'a>(
         &'a self,
         query_key: Option<&'a QueryKey>,
+        namespace: Option<&'a str>,
         hours: u32,
     ) -> BackendFuture<'a, Timeline> {
         Box::pin(async move {
+            let scoped = if query_key.is_none() {
+                self.database_timeline_key(namespace).await?
+            } else {
+                None
+            };
             Ok(self.timeline.lock().await.store.series(
                 TimelineBasis::ObservedByCollector,
-                query_key,
+                query_key.or(scoped.as_ref()),
                 hours,
             ))
         })
@@ -410,12 +488,18 @@ impl DatabaseBackend for PostgresBackend {
     fn timeline_range<'a>(
         &'a self,
         query_key: Option<&'a QueryKey>,
+        namespace: Option<&'a str>,
         range: MinuteRange,
     ) -> BackendFuture<'a, Timeline> {
         Box::pin(async move {
+            let scoped = if query_key.is_none() {
+                self.database_timeline_key(namespace).await?
+            } else {
+                None
+            };
             Ok(self.timeline.lock().await.store.series_range(
                 TimelineBasis::ObservedByCollector,
-                query_key,
+                query_key.or(scoped.as_ref()),
                 range,
             ))
         })

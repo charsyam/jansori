@@ -41,6 +41,7 @@ impl std::error::Error for BackendError {}
 /// never use EXPLAIN ANALYZE for this method.
 pub trait DatabaseBackend: Send + Sync {
     fn info(&self) -> BackendFuture<'_, DatabaseInfo>;
+    fn databases(&self) -> BackendFuture<'_, Vec<String>>;
     fn capabilities(&self) -> BackendFuture<'_, Capabilities>;
 
     fn explain<'a>(&'a self, request: &'a ExplainRequest) -> BackendFuture<'a, ExplainPlan>;
@@ -88,11 +89,13 @@ pub trait DatabaseBackend: Send + Sync {
     fn timeline<'a>(
         &'a self,
         query_key: Option<&'a QueryKey>,
+        namespace: Option<&'a str>,
         hours: u32,
     ) -> BackendFuture<'a, Timeline>;
     fn timeline_range<'a>(
         &'a self,
         query_key: Option<&'a QueryKey>,
+        namespace: Option<&'a str>,
         range: MinuteRange,
     ) -> BackendFuture<'a, Timeline>;
 }

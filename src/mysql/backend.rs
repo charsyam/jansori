@@ -50,6 +50,29 @@ fn capability(available: bool, reason: &str) -> Capability {
 }
 
 impl DatabaseBackend for MySqlBackend {
+    fn explain_query<'a>(&'a self, key: &'a QueryKey) -> BackendFuture<'a, ExplainPlan> {
+        Box::pin(async move {
+            let (namespace, sql) =
+                self.general_log
+                    .sample_sql(key)
+                    .await
+                    .ok_or_else(|| BackendError {
+                        kind: BackendErrorKind::InvalidRequest,
+                        message: "수집된 쿼리를 찾을 수 없습니다".into(),
+                    })?;
+            self.explain(&ExplainRequest { namespace, sql }).await
+        })
+    }
+
+    fn databases(&self) -> BackendFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            sqlx::query_scalar("SHOW DATABASES")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(query_error)
+        })
+    }
+
     fn info(&self) -> BackendFuture<'_, DatabaseInfo> {
         Box::pin(async move {
             let (version,): (String,) = sqlx::query_as("SELECT VERSION()")
@@ -188,17 +211,24 @@ impl DatabaseBackend for MySqlBackend {
     fn timeline<'a>(
         &'a self,
         query_key: Option<&'a QueryKey>,
+        namespace: Option<&'a str>,
         hours: u32,
     ) -> BackendFuture<'a, Timeline> {
-        Box::pin(async move { Ok(self.general_log.timeline(query_key, hours).await) })
+        Box::pin(async move { Ok(self.general_log.timeline(query_key, namespace, hours).await) })
     }
 
     fn timeline_range<'a>(
         &'a self,
         query_key: Option<&'a QueryKey>,
+        namespace: Option<&'a str>,
         range: MinuteRange,
     ) -> BackendFuture<'a, Timeline> {
-        Box::pin(async move { Ok(self.general_log.timeline_range(query_key, range).await) })
+        Box::pin(async move {
+            Ok(self
+                .general_log
+                .timeline_range(query_key, namespace, range)
+                .await)
+        })
     }
 }
 

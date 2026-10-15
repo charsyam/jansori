@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use sha2::{Digest, Sha256};
 use sqlx::{MySqlPool, Row};
 use tokio::sync::Mutex;
 
@@ -37,9 +38,16 @@ struct LogRow {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct StatementKey {
+    namespace: Option<String>,
     host: String,
     sql_hash: String,
     sql: String,
+}
+
+#[derive(Debug)]
+struct StatementAggregate {
+    calls: u64,
+    sample_sql: String,
 }
 
 #[derive(Debug)]
@@ -47,8 +55,9 @@ struct CollectorState {
     watermark: String,
     seen_at_watermark: HashMap<LogIdentity, u32>,
     own_threads: Vec<u64>,
+    thread_databases: HashMap<u64, Option<String>>,
     ignored_username: String,
-    statements: HashMap<StatementKey, u64>,
+    statements: HashMap<StatementKey, StatementAggregate>,
     hosts: HashMap<String, u64>,
     recent: VecDeque<RecentStatement>,
     timeline: TimelineStore,
@@ -87,44 +96,91 @@ impl CollectorState {
                     .identity
                     .user_host
                     .starts_with(&format!("{}[", self.ignored_username))
-                || !matches!(row.identity.command_type.as_str(), "Query" | "Execute")
             {
                 continue;
             }
 
+            let thread_id = row.identity.thread_id;
+            match row.identity.command_type.as_str() {
+                "Connect" | "Change user" => {
+                    self.thread_databases
+                        .insert(thread_id, connect_database(&row.identity.argument));
+                    continue;
+                }
+                "Init DB" => {
+                    self.thread_databases
+                        .insert(thread_id, Some(row.identity.argument.trim().to_owned()));
+                    continue;
+                }
+                "Quit" => {
+                    self.thread_databases.remove(&thread_id);
+                    continue;
+                }
+                "Query" | "Execute" => {}
+                _ => continue,
+            }
+            if let Some(database) = use_database(&row.identity.argument) {
+                self.thread_databases.insert(thread_id, Some(database));
+            }
+            let namespace = self.thread_databases.get(&thread_id).cloned().flatten();
+
             let host = extract_host(&row.identity.user_host);
+            let raw_sql = row.identity.argument;
+            let sql = redact_admin_statement(raw_sql.clone());
+            let normalized = normalize_statement(&sql);
+            // The log only supplies the first 8 KiB. Keep the full raw hash for
+            // truncated statements so a different suffix cannot be merged.
+            let hash_text = if row.truncated {
+                &row.identity.argument_hash
+            } else {
+                &normalized
+            };
+            let mut digest = Sha256::new();
+            digest.update(namespace.as_deref().unwrap_or(""));
+            digest.update([0]);
+            digest.update(hash_text);
+            let sql_hash = format!("{:x}", digest.finalize());
+            self.timeline.record(row.epoch_minute, &sql_hash, 1, 0.0);
             self.timeline
-                .record(row.epoch_minute, &row.identity.argument_hash, 1, 0.0);
-            self.timeline.record_recent(
-                row.epoch_five_seconds,
-                &row.identity.argument_hash,
-                1,
-                0.0,
-            );
-            self.timeline.record_scoped(
-                row.epoch_minute,
-                &format!("{host}:{}", row.identity.argument_hash),
-                1,
-            );
+                .record_recent(row.epoch_five_seconds, &sql_hash, 1, 0.0);
+            self.timeline
+                .record_scoped(row.epoch_minute, &format!("{host}:{sql_hash}"), 1);
             self.timeline.record_recent_scoped(
                 row.epoch_five_seconds,
-                &format!("{host}:{}", row.identity.argument_hash),
+                &format!("{host}:{sql_hash}"),
                 1,
                 0.0,
             );
-            let mut sql = redact_admin_statement(row.identity.argument);
+            if let Some(database) = &namespace {
+                self.timeline
+                    .record_scoped(row.epoch_minute, &format!("db:{database}"), 1);
+                self.timeline.record_recent_scoped(
+                    row.epoch_five_seconds,
+                    &format!("db:{database}"),
+                    1,
+                    0.0,
+                );
+            }
+            let mut display_sql = normalized;
             if row.truncated && sql != "[administrative statement redacted]" {
-                sql.push_str("\n…[truncated]");
+                display_sql.push_str("\n…[truncated]");
             }
             let key = StatementKey {
+                namespace: namespace.clone(),
                 host: host.clone(),
-                sql_hash: row.identity.argument_hash,
-                sql: sql.clone(),
+                sql_hash,
+                sql: display_sql,
             };
-            if let Some(count) = self.statements.get_mut(&key) {
-                *count += 1;
+            if let Some(aggregate) = self.statements.get_mut(&key) {
+                aggregate.calls += 1;
             } else if self.statements.len() < self.max_queries {
-                self.statements.insert(key, 1);
+                self.statements.insert(
+                    key,
+                    StatementAggregate {
+                        calls: 1,
+                        sample_sql: raw_sql,
+                    },
+                );
             } else {
                 self.dropped_new_queries += 1;
             }
@@ -132,7 +188,7 @@ impl CollectorState {
             self.recent.push_back(RecentStatement {
                 source: QuerySource::MySqlGeneralLog,
                 query_key: None,
-                namespace: None,
+                namespace,
                 sql,
                 host: Some(host),
                 duration_ms: None,
@@ -155,21 +211,19 @@ impl CollectorState {
         filter: &QueryFilter,
         sort: QuerySort,
     ) -> Result<Vec<QueryStats>, BackendError> {
-        if filter.namespace.is_some() {
-            return Err(BackendError {
-                kind: BackendErrorKind::Unsupported,
-                message: "general query log에는 쿼리의 기본 스키마 정보가 없습니다".into(),
-            });
-        }
         if sort != QuerySort::Calls {
             return Err(BackendError {
                 kind: BackendErrorKind::Unsupported,
                 message: "general query log에는 실행 시간과 검사 행 수가 없습니다".into(),
             });
         }
-        let mut totals: HashMap<&str, (&str, u64)> = HashMap::new();
-        for (key, calls) in &self.statements {
-            if filter.host.as_ref().is_some_and(|host| host != &key.host)
+        let mut totals: HashMap<&str, (&str, Option<&str>, u64)> = HashMap::new();
+        for (key, aggregate) in &self.statements {
+            if filter
+                .namespace
+                .as_ref()
+                .is_some_and(|database| key.namespace.as_ref() != Some(database))
+                || filter.host.as_ref().is_some_and(|host| host != &key.host)
                 || filter
                     .text_contains
                     .as_ref()
@@ -177,15 +231,18 @@ impl CollectorState {
             {
                 continue;
             }
-            let entry = totals.entry(&key.sql_hash).or_insert((&key.sql, 0));
-            entry.1 += calls;
+            let entry =
+                totals
+                    .entry(&key.sql_hash)
+                    .or_insert((&key.sql, key.namespace.as_deref(), 0));
+            entry.2 += aggregate.calls;
         }
         let mut rows: Vec<_> = totals
             .into_iter()
-            .map(|(hash, (sql, calls))| QueryStats {
+            .map(|(hash, (sql, namespace, calls))| QueryStats {
                 source: QuerySource::MySqlGeneralLog,
                 key: QueryKey(hash.to_owned()),
-                namespace: None,
+                namespace: namespace.map(str::to_owned),
                 statement_text: sql.to_owned(),
                 calls,
                 total_time_ms: None,
@@ -220,10 +277,10 @@ impl CollectorState {
         all.offset = 0;
         let mut rows = self.query_stats(&all, sort)?;
         for row in &mut rows {
-            let key = match &filter.host {
-                Some(host) => format!("{host}:{}", row.key.0),
-                None => row.key.0.clone(),
-            };
+            let key = filter
+                .host
+                .as_ref()
+                .map_or_else(|| row.key.0.clone(), |host| format!("{host}:{}", row.key.0));
             row.calls = self.timeline.query_calls(range, &key);
         }
         rows.retain(|row| row.calls > 0);
@@ -236,9 +293,22 @@ impl CollectorState {
     }
 
     fn host_stats(&self, filter: &HostFilter) -> Vec<HostStats> {
-        let mut rows: Vec<_> = self
-            .hosts
-            .iter()
+        let mut calls_by_host: HashMap<&str, u64> = HashMap::new();
+        if let Some(database) = &filter.namespace {
+            for (key, aggregate) in &self.statements {
+                if key.namespace.as_ref() == Some(database) {
+                    *calls_by_host.entry(&key.host).or_default() += aggregate.calls;
+                }
+            }
+        } else {
+            calls_by_host.extend(
+                self.hosts
+                    .iter()
+                    .map(|(host, calls)| (host.as_str(), *calls)),
+            );
+        }
+        let mut rows: Vec<_> = calls_by_host
+            .into_iter()
             .filter(|(host, _)| {
                 filter
                     .text_contains
@@ -246,10 +316,10 @@ impl CollectorState {
                     .is_none_or(|text| host.contains(text))
             })
             .map(|(host, calls)| HostStats {
-                host: host.clone(),
+                host: host.to_owned(),
                 current_connections: None,
                 total_connections: None,
-                statement_calls: Some(*calls),
+                statement_calls: Some(calls),
             })
             .collect();
         rows.sort_by(|a, b| {
@@ -262,6 +332,136 @@ impl CollectorState {
             .take(filter.limit as usize)
             .collect()
     }
+
+    fn sample_sql(&self, key: &QueryKey) -> Option<(Option<String>, String)> {
+        self.statements
+            .iter()
+            .find(|(statement, _)| statement.sql_hash == key.0)
+            .map(|(statement, aggregate)| {
+                (statement.namespace.clone(), aggregate.sample_sql.clone())
+            })
+    }
+}
+
+/// Replaces MySQL literal values while preserving identifiers and SQL operators.
+fn normalize_statement(sql: &str) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut normalized = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            if !normalized.is_empty() && !normalized.ends_with(' ') {
+                normalized.push(' ');
+            }
+            i += 1;
+            continue;
+        }
+        // Double quotes may be identifiers under ANSI_QUOTES, so leave them intact.
+        if c == '`' || c == '\'' {
+            let quote = c;
+            let start = i;
+            let mut closed = false;
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && quote != '`' && i + 1 < chars.len() {
+                    i += 2;
+                } else if chars[i] == quote {
+                    i += 1;
+                    if i < chars.len() && chars[i] == quote {
+                        i += 1;
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if quote == '`' || !closed {
+                normalized.extend(&chars[start..i]);
+            } else {
+                normalized.push('?');
+            }
+            continue;
+        }
+        if c == '#'
+            || c == '-'
+                && chars.get(i + 1) == Some(&'-')
+                && chars.get(i + 2).is_none_or(|next| next.is_whitespace())
+        {
+            while i < chars.len() && chars[i] != '\n' {
+                normalized.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            normalized.push('/');
+            normalized.push('*');
+            i += 2;
+            while i < chars.len() {
+                let end = chars[i] == '*' && chars.get(i + 1) == Some(&'/');
+                normalized.push(chars[i]);
+                i += 1;
+                if end {
+                    normalized.push('/');
+                    i += 1;
+                    break;
+                }
+            }
+            continue;
+        }
+        let numeric_start =
+            c.is_ascii_digit() || c == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit);
+        let previous_is_identifier =
+            i > 0 && (chars[i - 1].is_alphanumeric() || matches!(chars[i - 1], '_' | '$'));
+        if numeric_start && !previous_is_identifier {
+            let start = i;
+            if c == '0' && matches!(chars.get(i + 1), Some('x' | 'X' | 'b' | 'B')) {
+                i += 2;
+                while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+            } else {
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if chars.get(i) == Some(&'.') {
+                    i += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                if matches!(chars.get(i), Some('e' | 'E')) {
+                    let exponent = i;
+                    i += 1;
+                    if matches!(chars.get(i), Some('+' | '-')) {
+                        i += 1;
+                    }
+                    let digits = i;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if digits == i {
+                        i = exponent;
+                    }
+                }
+            }
+            if chars
+                .get(i)
+                .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '$'))
+            {
+                normalized.extend(&chars[start..i]);
+            } else {
+                normalized.push('?');
+            }
+            continue;
+        }
+        normalized.push(c);
+        i += 1;
+    }
+    normalized.trim().to_owned()
 }
 
 fn extract_host(user_host: &str) -> String {
@@ -278,6 +478,31 @@ fn extract_host(user_host: &str) -> String {
         .filter(|host| !host.is_empty())
         .unwrap_or(user_host)
         .to_owned()
+}
+
+fn connect_database(argument: &str) -> Option<String> {
+    let (_, suffix) = argument.rsplit_once(" on ")?;
+    let database = suffix
+        .split_once(" using ")
+        .map_or(suffix, |(name, _)| name)
+        .trim();
+    (!database.is_empty()).then(|| database.to_owned())
+}
+
+fn use_database(sql: &str) -> Option<String> {
+    let rest = sql
+        .trim()
+        .strip_prefix("USE ")
+        .or_else(|| sql.trim().strip_prefix("use "))?
+        .trim();
+    let name = rest.trim_end_matches(';').trim();
+    if name.starts_with('`') && name.ends_with('`') && name.len() >= 2 {
+        Some(name[1..name.len() - 1].replace("``", "`"))
+    } else if !name.is_empty() && !name.chars().any(char::is_whitespace) {
+        Some(name.to_owned())
+    } else {
+        None
+    }
 }
 
 fn redact_admin_statement(sql: String) -> String {
@@ -345,6 +570,7 @@ impl GeneralLogCollector {
                 watermark,
                 seen_at_watermark: HashMap::new(),
                 own_threads: Vec::new(),
+                thread_databases: HashMap::new(),
                 ignored_username,
                 statements: HashMap::new(),
                 hosts: HashMap::new(),
@@ -477,22 +703,34 @@ impl GeneralLogCollector {
         self.state.lock().await.dropped_new_queries
     }
 
-    pub async fn timeline(&self, query_key: Option<&QueryKey>, hours: u32) -> Timeline {
-        self.state
-            .lock()
-            .await
-            .timeline
-            .series(TimelineBasis::ReceivedAtServer, query_key, hours)
+    pub async fn sample_sql(&self, key: &QueryKey) -> Option<(Option<String>, String)> {
+        self.state.lock().await.sample_sql(key)
+    }
+
+    pub async fn timeline(
+        &self,
+        query_key: Option<&QueryKey>,
+        namespace: Option<&str>,
+        hours: u32,
+    ) -> Timeline {
+        let scoped = namespace.map(|database| QueryKey(format!("db:{database}")));
+        self.state.lock().await.timeline.series(
+            TimelineBasis::ReceivedAtServer,
+            query_key.or(scoped.as_ref()),
+            hours,
+        )
     }
 
     pub async fn timeline_range(
         &self,
         query_key: Option<&QueryKey>,
+        namespace: Option<&str>,
         range: MinuteRange,
     ) -> Timeline {
+        let scoped = namespace.map(|database| QueryKey(format!("db:{database}")));
         self.state.lock().await.timeline.series_range(
             TimelineBasis::ReceivedAtServer,
-            query_key,
+            query_key.or(scoped.as_ref()),
             range,
         )
     }
@@ -501,7 +739,6 @@ impl GeneralLogCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
 
     fn row(time: &str, sql: &str) -> LogRow {
         LogRow {
@@ -519,12 +756,116 @@ mod tests {
         }
     }
 
+    fn state() -> CollectorState {
+        CollectorState {
+            watermark: "2026-10-07 00:00:00.000001".into(),
+            seen_at_watermark: HashMap::new(),
+            own_threads: vec![],
+            thread_databases: HashMap::new(),
+            ignored_username: "jansori".into(),
+            statements: HashMap::new(),
+            hosts: HashMap::new(),
+            recent: VecDeque::new(),
+            timeline: TimelineStore::default(),
+            max_queries: 10,
+            max_recent: 10,
+            dropped_new_queries: 0,
+        }
+    }
+
+    #[test]
+    fn literals_are_grouped_without_changing_identifiers_or_operators() {
+        assert_eq!(
+            normalize_statement(
+                "SELECT `item2` FROM orders_2024 WHERE id=12 AND name='a\\'b' AND price=1.25e-3"
+            ),
+            "SELECT `item2` FROM orders_2024 WHERE id=? AND name=? AND price=?"
+        );
+        assert_eq!(
+            normalize_statement("SELECT * FROM orders_2025 WHERE id=13"),
+            "SELECT * FROM orders_2025 WHERE id=?"
+        );
+        assert_eq!(
+            normalize_statement("SELECT 'x' /*+ INDEX(t i1) */"),
+            "SELECT ? /*+ INDEX(t i1) */"
+        );
+    }
+
+    #[test]
+    fn values_share_one_query_within_database_but_databases_stay_separate() {
+        let mut state = state();
+        let mut connect = row(
+            "2026-10-07 00:00:00.000002",
+            "app@host on shop using TCP/IP",
+        );
+        connect.identity.command_type = "Connect".into();
+        let one = row(
+            "2026-10-07 00:00:00.000003",
+            "SELECT * FROM items WHERE id=1",
+        );
+        let two = row(
+            "2026-10-07 00:00:00.000004",
+            "SELECT * FROM items WHERE id=2",
+        );
+        let mut change = row("2026-10-07 00:00:00.000005", "archive");
+        change.identity.command_type = "Init DB".into();
+        let three = row(
+            "2026-10-07 00:00:00.000006",
+            "SELECT * FROM items WHERE id=3",
+        );
+        assert_eq!(state.ingest(vec![connect, one, two, change, three]), 3);
+        let all = QueryFilter {
+            limit: 10,
+            ..QueryFilter::default()
+        };
+        let rows = state.query_stats(&all, QuerySort::Calls).unwrap();
+        assert_eq!(rows.len(), 2);
+        let shop = rows
+            .iter()
+            .find(|row| row.namespace.as_deref() == Some("shop"))
+            .unwrap();
+        assert_eq!(shop.calls, 2);
+        assert_eq!(shop.statement_text, "SELECT * FROM items WHERE id=?");
+        assert_eq!(
+            state.sample_sql(&shop.key).unwrap().1,
+            "SELECT * FROM items WHERE id=1"
+        );
+        let archive = rows
+            .iter()
+            .find(|row| row.namespace.as_deref() == Some("archive"))
+            .unwrap();
+        assert_eq!(archive.calls, 1);
+        assert_ne!(shop.key, archive.key);
+        let filter = QueryFilter {
+            namespace: Some("shop".into()),
+            limit: 10,
+            ..QueryFilter::default()
+        };
+        assert_eq!(
+            state.query_stats(&filter, QuerySort::Calls).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            state
+                .timeline
+                .query_calls(MinuteRange::recent(1), "db:shop"),
+            2
+        );
+        let hosts = state.host_stats(&HostFilter {
+            namespace: Some("shop".into()),
+            limit: 10,
+            ..HostFilter::default()
+        });
+        assert_eq!(hosts[0].statement_calls, Some(2));
+    }
+
     #[test]
     fn same_timestamp_rows_are_counted_once_across_polls() {
         let mut state = CollectorState {
             watermark: "2026-10-07 00:00:00.000001".into(),
             seen_at_watermark: HashMap::new(),
             own_threads: vec![],
+            thread_databases: HashMap::new(),
             ignored_username: "jansori".into(),
             statements: HashMap::new(),
             hosts: HashMap::new(),
@@ -557,6 +898,7 @@ mod tests {
             watermark: "2026-10-07 00:00:00.000001".into(),
             seen_at_watermark: HashMap::new(),
             own_threads: vec![99],
+            thread_databases: HashMap::new(),
             ignored_username: "jansori".into(),
             statements: HashMap::new(),
             hosts: HashMap::new(),

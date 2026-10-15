@@ -68,6 +68,7 @@
 <body>
   <header><div><h1>Jansori</h1><div id="database" class="muted">연결 확인 중…</div></div><div id="status" class="muted"></div></header>
   <section class="panel"><h2>수집 상태</h2><p class="muted">스위치 모양은 현재 상태 표시입니다.</p><div id="capabilities" class="status-grid"></div></section>
+  <div class="row"><label>데이터베이스 <select id="database-filter"><option value="">모든 DB</option></select></label><span id="database-filter-note" class="muted"></span></div>
   <div class="row presets" role="group" aria-label="조회 기간">
     <button data-window="all" class="active">전체 누적</button><button data-window="1m">1분</button><button data-window="5m">5분</button><button data-window="10m">10분</button><button data-window="1h">1시간</button><button data-window="3h">3시간</button><button data-window="1d">1일</button><button data-window="3d">3일</button><button data-window="7d">7일</button>
   </div>
@@ -90,7 +91,7 @@
     <div class="muted">기간은 최근 7일까지 선택할 수 있습니다. 1시간 이상 그래프의 막대를 클릭하면 해당 구간으로 좁힙니다.</div>
     <div class="row"><input id="query-search" placeholder="SQL 텍스트 검색"><input id="query-host" placeholder="호스트 필터 (MySQL)"><select id="query-sort"><option value="calls">호출 수</option><option value="total_time">총 실행 시간</option><option value="mean_time">평균 실행 시간</option></select><button id="query-refresh">조회</button></div>
     <div id="query-message" class="muted">쿼리를 클릭하면 바로 아래에 실행 계획이 표시됩니다.</div>
-    <div class="scroll"><table><thead><tr><th>쿼리</th><th>호출 수</th><th>총 시간 (ms)</th><th>평균 시간 (ms)</th><th>출처</th></tr></thead><tbody id="queries"></tbody></table></div>
+    <div class="scroll"><table><thead><tr><th>DB</th><th>쿼리</th><th>호출 수</th><th>총 시간 (ms)</th><th>평균 시간 (ms)</th><th>예상 행</th><th>예상 비용</th><th>출처</th></tr></thead><tbody id="queries"></tbody></table></div>
     <div class="row" style="align-items:center; margin-top:12px">
       <label>페이지당 <select id="query-page-size"><option value="10" selected>10개</option><option value="25">25개</option><option value="50">50개</option><option value="100">100개</option></select></label>
       <button id="query-prev" type="button">이전</button><span id="query-page-info" class="muted">1페이지</span><button id="query-next" type="button">다음</button>
@@ -125,6 +126,9 @@
     let activeRange = null;
     let activeWindow = 'all';
     let databaseKind = null;
+    const planCache = new Map();
+    const planResults = new Map();
+    const selectedDatabase = () => $('database-filter').value;
     const windowLabels = { all: '전체 누적', '1m': '1분', '5m': '5분', '10m': '10분', '1h': '1시간', '3h': '3시간', '1d': '1일', '3d': '3일', '7d': '7일' };
     const ms = value => value == null ? '정보 없음' : Number(value).toFixed(5);
     function clearQuerySelection() {
@@ -175,12 +179,56 @@
       if (!response.ok) throw new Error(data.error || '조회 실패');
       return data;
     }
+    function getPlan(key) {
+      const cached = planCache.get(key);
+      if (cached && Date.now() - cached.time < 60000) return cached.promise;
+      if (planCache.size > 500) { planCache.clear(); planResults.clear(); }
+      const promise = getJson(`/api/queries/${encodeURIComponent(key)}/explain`)
+        .then(plan => { planResults.set(key, plan); renderQueries(); return plan; })
+        .catch(error => { planResults.set(key, null); renderQueries(); throw error; });
+      planCache.set(key, { time: Date.now(), promise });
+      return promise;
+    }
+    async function loadVisiblePlans(rows, request) {
+      const pending = rows.filter(row => /^select\s/i.test(row.statement_text.trim()) && (!planCache.has(row.key) || Date.now() - planCache.get(row.key).time >= 60000));
+      let next = 0;
+      async function worker() {
+        while (next < pending.length && request === queryRequest) {
+          const row = pending[next++];
+          try { await getPlan(row.key); } catch (_) { /* The row keeps its unavailable marker. */ }
+        }
+      }
+      await Promise.all([worker(), worker()]);
+    }
+    function estimate(plan, field) {
+      if (!plan) return '정보 없음';
+      function find(node) {
+        if (Number.isFinite(node?.[field])) return node[field];
+        for (const child of node?.children || []) {
+          const value = find(child);
+          if (value != null) return value;
+        }
+        return null;
+      }
+      const value = find(plan.root);
+      return value == null ? '정보 없음' : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
     async function refresh() {
       try {
-        const [info, capabilities] = await Promise.all([getJson('/api/info'), getJson('/api/capabilities')]);
+        const [info, capabilities, databases] = await Promise.all([getJson('/api/info'), getJson('/api/capabilities'), getJson('/api/databases')]);
         databaseKind = info.kind;
         updatePeriodControls();
         $('database').textContent = `${info.display_name} ${info.version}`;
+        const selector = $('database-filter');
+        const previous = selector.value;
+        const shown = Array.from(selector.options).slice(1).map(option => option.value);
+        if (shown.length !== databases.length || shown.some((name, index) => name !== databases[index])) {
+          selector.replaceChildren(new Option('모든 DB', ''), ...databases.map(name => new Option(name, name)));
+          selector.value = databases.includes(previous) ? previous : '';
+        }
+        $('database-filter-note').textContent = databaseKind === 'MySql'
+          ? 'MySQL은 수집 중 확인한 기본 DB 기준입니다. 시작 전 연결의 DB는 정보 없음으로 표시됩니다.'
+          : 'PostgreSQL은 pg_stat_statements의 데이터베이스 기준입니다.';
         $('capabilities').replaceChildren();
         for (const [name, value] of Object.entries(capabilities)) {
           const card = document.createElement('div');
@@ -214,6 +262,7 @@
       const params = rangeParams(new URLSearchParams({ sort: $('query-sort').value, limit: String(pageSize), offset: String(pageIndex * pageSize) }));
       if ($('query-search').value) params.set('search', $('query-search').value);
       if ($('query-host').value) params.set('host', $('query-host').value);
+      if (selectedDatabase()) params.set('namespace', selectedDatabase());
       try {
         const page = await getJson(`/api/queries/page?${params}`);
         if (request !== queryRequest) return;
@@ -231,6 +280,7 @@
         $('query-prev').disabled = pageIndex === 0;
         $('query-next').disabled = (pageIndex + 1) * pageSize >= pageTotal;
         renderQueries();
+        loadVisiblePlans(queryRows, request);
       } catch (error) { if (request === queryRequest) { $('query-message').textContent = error.message; $('queries').replaceChildren(); $('query-prev').disabled = true; $('query-next').disabled = true; } }
     }
     function planText(plan) {
@@ -386,13 +436,15 @@
           sql.append(document.createElement('br'), copy);
           tr.title = '클릭하면 실행 계획을 조회';
           tr.onclick = () => selectQuery(row);
-          tr.append(sql, cell(row.calls), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(row.source));
+          const plan = planResults.get(row.key);
+          const estimateText = field => !/^select\s/i.test(row.statement_text.trim()) ? '정보 없음' : planResults.has(row.key) ? estimate(plan, field) : '조회 중…';
+          tr.append(cell(row.namespace), sql, cell(row.calls), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(estimateText('estimated_rows')), cell(estimateText('estimated_cost')), cell(row.source));
           $('queries').append(tr);
           if (row.key === selectedKey) {
             const detail = document.createElement('tr');
             detail.className = 'plan-detail';
             const td = document.createElement('td');
-            td.colSpan = 5;
+            td.colSpan = 8;
             if (selectedLoading) {
               td.textContent = '실행 계획 조회 중…';
             } else if (selectedError) {
@@ -440,6 +492,7 @@
       const params = rangeParams(new URLSearchParams());
       if (!activeRange && activeWindow === 'all') params.set('hours', '168');
       if (key) params.set('query_key', key);
+      if (selectedDatabase()) params.set('namespace', selectedDatabase());
       const graphPeriod = activeRange ? '직접 지정한 기간' : activeWindow === 'all' ? '최근 7일 호출 추이' : `최근 ${windowLabels[activeWindow]}`;
       $('timeline-title').textContent = `${key ? '선택한 쿼리' : '전체 쿼리'} · ${graphPeriod}`;
       try {
@@ -520,7 +573,7 @@
       renderQueries();
       refreshTimeline();
       try {
-        const plan = await getJson(`/api/queries/${encodeURIComponent(row.key)}/explain`);
+        const plan = await getPlan(row.key);
         if (request !== selectionRequest) return;
         selectedPlan = plan;
       } catch (error) {
@@ -535,7 +588,9 @@
     }
     async function refreshHosts() {
       try {
-        const rows = await getJson('/api/hosts?limit=100');
+        const params = new URLSearchParams({ limit: '100' });
+        if (selectedDatabase()) params.set('namespace', selectedDatabase());
+        const rows = await getJson(`/api/hosts?${params}`);
         $('hosts').replaceChildren();
         for (const row of rows) { const tr = document.createElement('tr'); tr.append(cell(row.host), cell(row.current_connections), cell(row.statement_calls)); $('hosts').append(tr); }
       } catch (error) { $('hosts').replaceChildren(); $('status').textContent = error.message; }
@@ -543,6 +598,7 @@
     $('query-refresh').onclick = refreshFirstPage;
     $('query-page-size').onchange = refreshFirstPage;
     $('query-sort').onchange = refreshFirstPage;
+    $('database-filter').onchange = () => { refreshFirstPage(); refreshHosts(); };
     $('query-prev').onclick = () => {
       if (pageIndex === 0) return;
       pageIndex--;

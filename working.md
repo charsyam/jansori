@@ -1,6 +1,6 @@
 # Jansori 작업 현황
 
-마지막 갱신: 2026-10-07
+마지막 갱신: 2026-10-15
 
 상태 표기: `완료` / `진행 중` / `대기` / `결정 필요`
 
@@ -16,7 +16,7 @@
 | 공통 백엔드 인터페이스 | 완료 | DB 정보·기능 상태·실행 계획·쿼리/호스트 통계 계약 작성. general log의 실행 시간 부재도 모델에 반영 |
 | MySQL 어댑터 | 완료 | SELECT EXPLAIN, general query log 통계 구현 |
 | MySQL 전체 쿼리 수집 경로 | 완료 | Performance Schema가 꺼진 경우 general query log 사용. 프록시 사용하지 않음 |
-| General query log 수집기 | 완료 | TABLE 출력에서 새 행 수집, 동일 타임스탬프 중복 제거, 전체 SQL 해시 집계, 표시 길이·배치·메모리 상한. SQL 정규화는 미구현 |
+| General query log 수집기 | 완료 | TABLE 출력에서 새 행 수집, 동일 타임스탬프 중복 제거, 리터럴 값 정규화 집계, 표시 길이·배치·메모리 상한 |
 | PostgreSQL 어댑터 | 완료 | SELECT EXPLAIN, pg_stat_statements 쿼리 통계, 현재 호스트 연결 수 |
 | 수집 기능 진단 | 완료 | MySQL general_log/TABLE, PostgreSQL pg_stat_statements 활성화 상태 표시 |
 | 쿼리/호스트 통계 API | 완료 | 검색·정렬·페이지네이션 API. 수집원에 없는 지표의 정렬은 사용 불가 응답 |
@@ -44,6 +44,9 @@
 | 기간 선택 버튼 이동 | 완료 | 전체 누적·1분~7일 선택을 기간별 호출 그래프 위에 배치 |
 | 재시작 직후 빈 그래프 안내 | 완료 | 메모리 추이 초기화로 0회일 때 그래프 영역에 안내를 표시하고 데모 호출 재생성 |
 | 5분 기간 경계 수정 | 완료 | 5분·10분 조회를 5초 기록으로 집계해 분 경계 직전 호출 누락 방지 |
+| MySQL 값별 쿼리 중복 집계 수정 | 완료 | 같은 DB에서 숫자·작은따옴표 리터럴만 다른 SQL을 한 쿼리로 집계하고 실행 계획은 실제 SQL 예시로 조회 |
+| 데이터베이스 선택 | 완료 | DB 목록을 조회하고 쿼리·호스트·추이를 선택한 DB로 필터링. MySQL은 수집 중 확인한 기본 DB 기준 |
+| 목록의 예상 행·비용 | 완료 | 현재 페이지의 SELECT 추정 계획을 제한된 동시 요청으로 조회해 목록에 표시 |
 | 데모 사용자 테이블 이름 정리 | 대기 | 사용자가 데이터 흐름 확인을 위해 잠시 중단 요청. DB 테이블과 통계는 아직 변경하지 않음 |
 | `daily_charsyam` MySQL 접속 확인 | 대기 | 사용자 터미널에서는 0:3306 접속 시 `mysql_native_password` 미로드 오류. 배포 설정은 MySQL 8.4이며 해당 인증 플러그인은 기본 비활성화. 이 실행 환경의 소켓 연결은 EPERM이라 직접 인증은 아직 불가 |
 | `daily_mysql` 서비스 상태 확인 | 대기 | Jansori 중단 제보를 MySQL 중단으로 잘못 해석했음. MySQL 중단 여부는 요청되지 않았고 상태 미확인 |
@@ -67,6 +70,7 @@
 
 ## 검증 기록
 
+- 2026-10-15: `cargo test --offline` 10개 통과, 웹 스크립트 문법 검사와 `git diff --check` 통과. 새 빌드로 `jansori-daily`를 재시작하고 기본 및 DB 필터 쿼리·호스트·추이 API 200 확인.
 - 2026-10-07: 임시 Rust 1.99.0 도구체인으로 `cargo check` 통과. `cargo fmt` 적용. 실제 DB 어댑터는 아직 구현 전이다.
 - 2026-10-07: general query log 수집을 결정하고 공통 통계 모델에 수집원 및 선택적 실행 시간 필드 추가.
 - 2026-10-07: `cargo test` 4개 통과. MySQL 8.4.4에서 `performance_schema=OFF`/general log TABLE로 테이블 설명, EXPLAIN, 쿼리 호출 수, 호스트 집계를 확인. PostgreSQL 16.15에서 pg_stat_statements 활성화 전후, 테이블 설명, EXPLAIN, 쿼리 통계를 확인. 실제 DB 검증 중 MySQL `USE` 프로토콜과 인덱스 컬럼 타입 오류를 수정.

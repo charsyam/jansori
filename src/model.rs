@@ -87,7 +87,7 @@ pub struct QueryStats {
     pub source: QuerySource,
     pub key: QueryKey,
     pub namespace: Option<String>,
-    /// A normalized digest when available; exact statement text for a general log source.
+    /// A normalized statement. MySQL general log literals are shown as `?`.
     pub statement_text: String,
     pub calls: u64,
     /// `None` when the collection source does not record execution duration.
@@ -102,6 +102,7 @@ pub struct QueryStats {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub struct HostFilter {
+    pub namespace: Option<String>,
     pub text_contains: Option<String>,
     pub limit: u32,
     pub offset: u32,
