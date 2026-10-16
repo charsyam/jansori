@@ -209,6 +209,24 @@ fn table_refs(tokens: &[Token], default_schema: &str) -> Vec<TableRef> {
     result
 }
 
+fn is_boolean_literal(token: Option<&Token>) -> bool {
+    token.is_some_and(|token| token.is("TRUE") || token.is("FALSE"))
+}
+
+fn compares_with_boolean(tokens: &[Token], start: usize, next: usize) -> bool {
+    let after = if tokens.get(next).is_some_and(|token| token.is("IS")) {
+        next + 1 + usize::from(tokens.get(next + 1).is_some_and(|token| token.is("NOT")))
+    } else if tokens.get(next) == Some(&Token::Other) {
+        next + 1 + usize::from(tokens.get(next + 1) == Some(&Token::Other))
+    } else {
+        next
+    };
+    (after != next && is_boolean_literal(tokens.get(after)))
+        || (start >= 2
+            && tokens[start - 1] == Token::Other
+            && is_boolean_literal(tokens.get(start - 2)))
+}
+
 fn where_refs(tokens: &[Token]) -> Vec<(Option<String>, String)> {
     let mut result = Vec::new();
     let mut depth = 0;
@@ -269,12 +287,16 @@ fn where_refs(tokens: &[Token]) -> Vec<(Option<String>, String)> {
             if let Some(column) = tokens.get(i + 2).and_then(Token::word) {
                 if tokens.get(i + 3) == Some(&Token::Dot) {
                     if let Some(last) = tokens.get(i + 4).and_then(Token::word) {
-                        result.push((Some(column.to_owned()), last.to_owned()));
+                        if !compares_with_boolean(tokens, i, i + 5) {
+                            result.push((Some(column.to_owned()), last.to_owned()));
+                        }
                         i += 5;
                         continue;
                     }
                 }
-                result.push((Some(word.to_owned()), column.to_owned()));
+                if !compares_with_boolean(tokens, i, i + 3) {
+                    result.push((Some(word.to_owned()), column.to_owned()));
+                }
                 i += 3;
                 continue;
             }
@@ -287,7 +309,9 @@ fn where_refs(tokens: &[Token]) -> Vec<(Option<String>, String)> {
             && tokens.get(i + 1) != Some(&Token::Open)
             && (i == 0 || tokens[i - 1] != Token::Dot)
         {
-            result.push((None, word.to_owned()));
+            if !compares_with_boolean(tokens, i, i + 1) {
+                result.push((None, word.to_owned()));
+            }
         }
         i += 1;
     }
@@ -413,6 +437,18 @@ mod tests {
                 (Some("p".into()), "title".into()),
                 (Some("p".into()), "id".into()),
                 (Some("p".into()), "status".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_boolean_comparisons_but_keeps_other_predicates() {
+        let sql = "SELECT * FROM posts p WHERE p.visible = TRUE AND p.deleted IS NOT FALSE AND FALSE = p.archived AND p.status = 'published' AND p.id = 42";
+        assert_eq!(
+            where_refs(&tokens(sql)),
+            vec![
+                (Some("p".into()), "status".into()),
+                (Some("p".into()), "id".into()),
             ]
         );
     }
