@@ -2,6 +2,10 @@
 
 MySQL과 PostgreSQL 쿼리 활동, 호스트, 추정 실행 계획을 보는 작은 Rust 웹 도구입니다.
 
+## 화면
+
+![Jansori 쿼리 분석 화면](jansori.png)
+
 ## 실행
 
 Rust 1.94 이상이 필요합니다.
