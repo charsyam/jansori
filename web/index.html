@@ -53,8 +53,10 @@
     .index-table .yes { color: #17613c; font-weight: 700; }
     .index-table .no { color: #9b3326; font-weight: 700; }
     .where-columns { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
-    .where-column { display: inline-block; border: 1px solid #b9dec5; border-radius: 5px; padding: 4px 7px; background: #f3fbf5; color: #17613c; font-weight: 600; }
+    .where-column { display: inline-block; border: 1px solid #c9d3dc; border-radius: 5px; padding: 4px 7px; background: white; color: #182331; font-weight: 600; }
+    .where-column.partial { border-color: #e7bd72; background: #fff3dc; color: #805000; }
     .where-column.unindexed { border-color: #e8a69c; background: #fff0ec; color: #9b3326; }
+    .where-index-summary { margin-top: 8px; }
     .raw-explain-table { margin-top: 8px; }
     .raw-explain-table th, .raw-explain-table td { white-space: pre; }
     .raw-explain-table.pg td { font-family: monospace; }
@@ -413,11 +415,15 @@
       return lines.join('\n');
     }
     function whereIndexBadge(plan) {
-      const missing = (plan?.where_columns || []).filter(column => !column.index_names.length);
-      if (!missing.length) return null;
+      const columns = plan?.where_columns || [];
+      if (!columns.length) return null;
+      const missing = columns.filter(column => !column.index_names.length);
+      const indexedCount = columns.length - missing.length;
       const badge = document.createElement('span');
-      badge.className = 'where-column unindexed';
-      badge.textContent = `WHERE 인덱스 없음: ${missing.map(column => `${column.table}.${column.column}`).join(', ')}`;
+      badge.className = `where-column${indexedCount === 0 ? ' unindexed' : missing.length ? ' partial' : ''}`;
+      const status = indexedCount === 0 ? '전부 없음' : missing.length ? '일부 있음' : '전부 있음';
+      badge.textContent = `WHERE 인덱스 ${status} (${indexedCount}/${columns.length})`;
+      if (missing.length) badge.textContent += ` · 없음: ${missing.map(column => `${column.table}.${column.column}`).join(', ')}`;
       return badge;
     }
     function whereIndexDetails(plan) {
@@ -425,6 +431,9 @@
       const box = document.createElement('div');
       const heading = document.createElement('strong');
       heading.textContent = 'WHERE 컬럼의 인덱스 정의';
+      const summary = document.createElement('div');
+      summary.className = 'where-index-summary';
+      summary.append(whereIndexBadge(plan));
       const columns = document.createElement('div');
       columns.className = 'where-columns';
       for (const column of plan.where_columns) {
@@ -435,8 +444,8 @@
       }
       const note = document.createElement('p');
       note.className = 'muted';
-      note.textContent = '빨간색은 컬럼이 인덱스 정의에 없다는 뜻입니다. 인덱스 추가가 항상 유리한 것은 아니며, 기존 인덱스도 이번 계획에서 쓰이지 않을 수 있습니다.';
-      box.append(heading, columns, note);
+      note.textContent = '확인된 WHERE 컬럼을 모두 비교합니다. 빨간색은 전부 없음, 주황색은 일부 있음, 흰색은 전부 인덱스 정의에 포함됨을 뜻합니다. 복합 인덱스의 컬럼 순서와 실제 실행 계획에서의 사용 여부는 별도로 확인하세요.';
+      box.append(heading, summary, columns, note);
       return box;
     }
     function indexAssessment(plan) {
