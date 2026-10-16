@@ -182,6 +182,14 @@ pub struct ExplainPlan {
     pub raw_explain: ExplainOutput,
     /// Columns confidently resolved from a SELECT's top-level WHERE clause.
     pub where_columns: Vec<WhereColumn>,
+    /// SQL shapes worth reviewing alongside the actual EXPLAIN access path.
+    pub pattern_hints: Vec<SqlPatternHint>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct SqlPatternHint {
+    pub kind: String,
+    pub count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]

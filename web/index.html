@@ -57,6 +57,9 @@
     .where-column.partial { border-color: #e7bd72; background: #fff3dc; color: #805000; }
     .where-column.unindexed { border-color: #e8a69c; background: #fff0ec; color: #9b3326; }
     .where-index-summary { margin-top: 8px; }
+    .pattern-hint { display: inline-block; border: 1px solid #e7bd72; border-radius: 5px; padding: 4px 7px; background: #fff3dc; color: #805000; font-weight: 600; }
+    .pattern-hints { margin: 10px 0; }
+    .pattern-hints ul { margin: 8px 0; padding-left: 22px; }
     .raw-explain-table { margin-top: 8px; }
     .raw-explain-table th, .raw-explain-table td { white-space: pre; }
     .raw-explain-table.pg td { font-family: monospace; }
@@ -322,6 +325,8 @@
         if (selectedBottleneck === row.key) {
           const badge = whereIndexBadge(bottleneckPlan);
           if (badge) sql.append(document.createElement('br'), badge);
+          const patternBadge = patternHintBadge(bottleneckPlan);
+          if (patternBadge) sql.append(document.createElement('br'), patternBadge);
         }
         tr.append(cell(row.namespace), sql, cell(row.calls.toLocaleString()), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(Math.round(row.rows_examined / row.calls).toLocaleString()), cell(Math.round(row.rows_sent / row.calls).toLocaleString()));
         tr.onclick = async () => {
@@ -359,6 +364,8 @@
             td.append(heading, note);
             const whereDetails = whereIndexDetails(bottleneckPlan);
             if (whereDetails) td.append(whereDetails);
+            const patternDetails = patternHintDetails(bottleneckPlan);
+            if (patternDetails) td.append(patternDetails);
             td.append(indexTable(assessment, bottleneckPlan.database), plan);
           } else {
             const note = document.createElement('p');
@@ -446,6 +453,41 @@
       note.className = 'muted';
       note.textContent = '참·거짓과 비교하는 조건을 제외한 WHERE 컬럼을 비교합니다. 빨간색은 전부 없음, 주황색은 일부 있음, 흰색은 전부 인덱스 정의에 포함됨을 뜻합니다. 복합 인덱스의 컬럼 순서와 실제 실행 계획에서의 사용 여부는 별도로 확인하세요.';
       box.append(heading, summary, columns, note);
+      return box;
+    }
+    const patternInfo = {
+      not_in: ['NOT IN', '제외할 값이 많은지, NULL이 포함될 수 있는지 확인하세요.'],
+      not_like: ['NOT LIKE', '패턴으로 넓은 범위를 제외한다면 많은 행을 읽을 수 있습니다.'],
+      not: ['NOT 조건', '조건을 긍정형으로 바꿀 수 있는지 확인하세요.'],
+      not_equal: ['!= / <>', '일치하지 않는 값의 비율이 높으면 많은 행을 읽을 수 있습니다.'],
+      leading_wildcard_like: ['앞쪽 와일드카드 LIKE', 'LIKE 패턴이 % 또는 _로 시작하면 일반 B-tree 인덱스로 범위를 좁히기 어렵습니다.']
+    };
+    function patternHintBadge(plan) {
+      if (!plan?.pattern_hints?.length) return null;
+      const badge = document.createElement('span');
+      badge.className = 'pattern-hint';
+      const count = plan.pattern_hints.reduce((total, hint) => total + hint.count, 0);
+      badge.textContent = `검토할 SQL 패턴 ${count}개`;
+      return badge;
+    }
+    function patternHintDetails(plan) {
+      if (!plan?.pattern_hints?.length) return null;
+      const box = document.createElement('div');
+      box.className = 'pattern-hints';
+      const heading = document.createElement('strong');
+      heading.textContent = '검토할 SQL 패턴';
+      const list = document.createElement('ul');
+      for (const hint of plan.pattern_hints) {
+        const info = patternInfo[hint.kind];
+        if (!info) continue;
+        const item = document.createElement('li');
+        item.textContent = `${info[0]} ${hint.count}회 · ${info[1]}`;
+        list.append(item);
+      }
+      const note = document.createElement('p');
+      note.className = 'muted';
+      note.textContent = '패턴만으로 인덱스 미사용을 확정할 수 없습니다. 아래 EXPLAIN의 접근 방식과 예상 행을 함께 확인하세요.';
+      box.append(heading, list, note);
       return box;
     }
     function indexAssessment(plan) {
@@ -590,6 +632,8 @@
           const plan = planResults.get(row.key);
           const badge = whereIndexBadge(plan);
           if (badge) sql.append(document.createElement('br'), badge);
+          const patternBadge = patternHintBadge(plan);
+          if (patternBadge) sql.append(document.createElement('br'), patternBadge);
           const estimateText = metric => !/^select\s/i.test(row.statement_text.trim()) ? '정보 없음' : planResults.has(row.key) ? metric(plan) : '조회 중…';
           tr.append(cell(row.namespace), sql, cell(row.calls), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(row.rows_examined == null ? '정보 없음' : Number(row.rows_examined).toLocaleString()), cell(estimateText(estimatedRows)), cell(estimateText(estimatedCost)), cell(row.source === 'MySqlGeneralLog' && row.total_time_ms != null ? '일반 로그 + 성능 통계' : row.source));
           $('queries').append(tr);
@@ -641,6 +685,8 @@
               td.append(title, indexBox);
               const whereDetails = whereIndexDetails(selectedPlan);
               if (whereDetails) td.append(whereDetails);
+              const patternDetails = patternHintDetails(selectedPlan);
+              if (patternDetails) td.append(patternDetails);
               td.append(indexTable(assessment, selectedPlan.database), indexColumnsNote, summary, details);
             }
             detail.append(td);

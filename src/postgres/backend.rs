@@ -310,6 +310,7 @@ impl DatabaseBackend for PostgresBackend {
                     rows: text_rows,
                 },
                 where_columns: Vec::new(),
+                pattern_hints: Vec::new(),
             })
         })
     }

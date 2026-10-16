@@ -7,11 +7,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use sqlx::{MySqlConnection, Row};
 
-use crate::model::WhereColumn;
+use crate::model::{SqlPatternHint, WhereColumn};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Word(String),
+    String(String),
+    Symbol(char),
     Dot,
     Open,
     Close,
@@ -58,21 +60,27 @@ fn tokens(sql: &str) -> Vec<Token> {
         } else if c == '\'' || c == '"' {
             let quote = c;
             i += 1;
+            let mut literal = String::new();
             while i < chars.len() {
                 if chars[i] == '\\' {
+                    if let Some(next) = chars.get(i + 1) {
+                        literal.push(*next);
+                    }
                     i = (i + 2).min(chars.len());
                 } else if chars[i] == quote {
                     if chars.get(i + 1) == Some(&quote) {
+                        literal.push(quote);
                         i += 2;
                     } else {
                         i += 1;
                         break;
                     }
                 } else {
+                    literal.push(chars[i]);
                     i += 1;
                 }
             }
-            result.push(Token::Other);
+            result.push(Token::String(literal));
         } else if c == '`' {
             i += 1;
             let mut word = String::new();
@@ -106,6 +114,7 @@ fn tokens(sql: &str) -> Vec<Token> {
                 '(' => Token::Open,
                 ')' => Token::Close,
                 ',' => Token::Comma,
+                '!' | '<' | '>' | '=' => Token::Symbol(c),
                 _ => Token::Other,
             });
             i += 1;
@@ -216,19 +225,18 @@ fn is_boolean_literal(token: Option<&Token>) -> bool {
 fn compares_with_boolean(tokens: &[Token], start: usize, next: usize) -> bool {
     let after = if tokens.get(next).is_some_and(|token| token.is("IS")) {
         next + 1 + usize::from(tokens.get(next + 1).is_some_and(|token| token.is("NOT")))
-    } else if tokens.get(next) == Some(&Token::Other) {
-        next + 1 + usize::from(tokens.get(next + 1) == Some(&Token::Other))
+    } else if matches!(tokens.get(next), Some(Token::Symbol(_))) {
+        next + 1 + usize::from(matches!(tokens.get(next + 1), Some(Token::Symbol(_))))
     } else {
         next
     };
     (after != next && is_boolean_literal(tokens.get(after)))
         || (start >= 2
-            && tokens[start - 1] == Token::Other
+            && matches!(tokens[start - 1], Token::Symbol(_))
             && is_boolean_literal(tokens.get(start - 2)))
 }
 
-fn where_refs(tokens: &[Token]) -> Vec<(Option<String>, String)> {
-    let mut result = Vec::new();
+fn where_span(tokens: &[Token]) -> Option<(usize, usize)> {
     let mut depth = 0;
     let mut start = None;
     for (i, token) in tokens.iter().enumerate() {
@@ -242,9 +250,7 @@ fn where_refs(tokens: &[Token]) -> Vec<(Option<String>, String)> {
             break;
         }
     }
-    let Some(start) = start else {
-        return result;
-    };
+    let start = start?;
     let mut end = tokens.len();
     depth = 0;
     for (offset, token) in tokens[start..].iter().enumerate() {
@@ -262,6 +268,14 @@ fn where_refs(tokens: &[Token]) -> Vec<(Option<String>, String)> {
             break;
         }
     }
+    Some((start, end))
+}
+
+fn where_refs(tokens: &[Token]) -> Vec<(Option<String>, String)> {
+    let mut result = Vec::new();
+    let Some((start, end)) = where_span(tokens) else {
+        return result;
+    };
     let mut i = start;
     while i < end {
         // Subquery names belong to their own scope; leave them unclassified.
@@ -316,6 +330,72 @@ fn where_refs(tokens: &[Token]) -> Vec<(Option<String>, String)> {
         i += 1;
     }
     result
+}
+
+pub fn pattern_hints(sql: &str) -> Vec<SqlPatternHint> {
+    let tokens = tokens(sql);
+    let Some((start, end)) = where_span(&tokens) else {
+        return Vec::new();
+    };
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut i = start;
+    while i < end {
+        // Nested SELECTs have their own WHERE clause and EXPLAIN steps.
+        if tokens[i] == Token::Open && tokens.get(i + 1).is_some_and(|token| token.is("SELECT")) {
+            let mut nested = 1;
+            i += 1;
+            while i < end && nested > 0 {
+                if tokens[i] == Token::Open {
+                    nested += 1;
+                } else if tokens[i] == Token::Close {
+                    nested -= 1;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let hint = if tokens[i].is("NOT") {
+            let next = tokens.get(i + 1);
+            if next.is_some_and(|token| token.is("IN")) {
+                Some("not_in")
+            } else if next.is_some_and(|token| token.is("LIKE")) {
+                Some("not_like")
+            } else if i > start
+                && tokens[i - 1].is("IS")
+                && next
+                    .is_some_and(|token| token.is("NULL") || token.is("TRUE") || token.is("FALSE"))
+            {
+                None
+            } else if next.is_some_and(|token| token.is("EXISTS")) {
+                None
+            } else {
+                Some("not")
+            }
+        } else if matches!(
+            (tokens.get(i), tokens.get(i + 1)),
+            (Some(Token::Symbol('!')), Some(Token::Symbol('=')))
+                | (Some(Token::Symbol('<')), Some(Token::Symbol('>')))
+        ) {
+            Some("not_equal")
+        } else if tokens[i].is("LIKE")
+            && matches!(tokens.get(i + 1), Some(Token::String(value)) if value.starts_with('%') || value.starts_with('_'))
+        {
+            Some("leading_wildcard_like")
+        } else {
+            None
+        };
+        if let Some(hint) = hint {
+            *counts.entry(hint).or_default() += 1;
+        }
+        i += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(kind, count)| SqlPatternHint {
+            kind: kind.to_owned(),
+            count,
+        })
+        .collect()
 }
 
 pub async fn inspect(
@@ -449,6 +529,50 @@ mod tests {
             vec![
                 (Some("p".into()), "status".into()),
                 (Some("p".into()), "id".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_reviewable_where_patterns_without_sql_text_false_positives() {
+        let sql = "SELECT * FROM posts WHERE id NOT IN (1, 2) AND status NOT IN (3, 4) AND NOT (archived = 1) AND title LIKE '%foo' AND body LIKE 'foo%' AND score != 1 AND rank <> 2 AND deleted_at IS NOT NULL AND note = 'NOT IN' /* NOT LIKE */ ORDER BY id";
+        assert_eq!(
+            pattern_hints(sql),
+            vec![
+                SqlPatternHint {
+                    kind: "leading_wildcard_like".into(),
+                    count: 1
+                },
+                SqlPatternHint {
+                    kind: "not".into(),
+                    count: 1
+                },
+                SqlPatternHint {
+                    kind: "not_equal".into(),
+                    count: 2
+                },
+                SqlPatternHint {
+                    kind: "not_in".into(),
+                    count: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_patterns_inside_nested_selects() {
+        let sql = "SELECT * FROM posts WHERE id IN (SELECT post_id FROM logs WHERE level NOT IN (1, 2)) AND title NOT LIKE '%tmp'";
+        assert_eq!(
+            pattern_hints(sql),
+            vec![
+                SqlPatternHint {
+                    kind: "leading_wildcard_like".into(),
+                    count: 1
+                },
+                SqlPatternHint {
+                    kind: "not_like".into(),
+                    count: 1
+                },
             ]
         );
     }

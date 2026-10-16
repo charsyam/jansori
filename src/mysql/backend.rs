@@ -212,6 +212,7 @@ impl DatabaseBackend for MySqlBackend {
                     rows,
                 },
                 where_columns,
+                pattern_hints: where_columns::pattern_hints(sql),
             })
         })
     }
