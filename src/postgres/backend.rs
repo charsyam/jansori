@@ -309,6 +309,7 @@ impl DatabaseBackend for PostgresBackend {
                     columns: vec!["QUERY PLAN".into()],
                     rows: text_rows,
                 },
+                where_columns: Vec::new(),
             })
         })
     }

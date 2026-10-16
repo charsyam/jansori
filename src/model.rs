@@ -180,6 +180,15 @@ pub struct ExplainPlan {
     pub raw_json: String,
     /// Engine-native EXPLAIN output presented as its original rows and columns.
     pub raw_explain: ExplainOutput,
+    /// Columns confidently resolved from a SELECT's top-level WHERE clause.
+    pub where_columns: Vec<WhereColumn>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct WhereColumn {
+    pub table: String,
+    pub column: String,
+    pub index_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]

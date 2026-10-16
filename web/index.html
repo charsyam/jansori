@@ -52,6 +52,9 @@
     .index-table td { word-break: break-word; }
     .index-table .yes { color: #17613c; font-weight: 700; }
     .index-table .no { color: #9b3326; font-weight: 700; }
+    .where-columns { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+    .where-column { display: inline-block; border: 1px solid #b9dec5; border-radius: 5px; padding: 4px 7px; background: #f3fbf5; color: #17613c; font-weight: 600; }
+    .where-column.unindexed { border-color: #e8a69c; background: #fff0ec; color: #9b3326; }
     .raw-explain-table { margin-top: 8px; }
     .raw-explain-table th, .raw-explain-table td { white-space: pre; }
     .raw-explain-table.pg td { font-family: monospace; }
@@ -313,7 +316,12 @@
       for (const row of bottleneckRows) {
         const tr = document.createElement('tr');
         tr.className = 'query-row' + (selectedBottleneck === row.key ? ' selected' : '');
-        tr.append(cell(row.namespace), cell(row.statement_text), cell(row.calls.toLocaleString()), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(Math.round(row.rows_examined / row.calls).toLocaleString()), cell(Math.round(row.rows_sent / row.calls).toLocaleString()));
+        const sql = cell(row.statement_text);
+        if (selectedBottleneck === row.key) {
+          const badge = whereIndexBadge(bottleneckPlan);
+          if (badge) sql.append(document.createElement('br'), badge);
+        }
+        tr.append(cell(row.namespace), sql, cell(row.calls.toLocaleString()), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(Math.round(row.rows_examined / row.calls).toLocaleString()), cell(Math.round(row.rows_sent / row.calls).toLocaleString()));
         tr.onclick = async () => {
           selectedBottleneck = selectedBottleneck === row.key ? null : row.key;
           bottleneckPlan = null;
@@ -346,7 +354,10 @@
             note.textContent = '대표 SQL의 계획은 묶음 안의 모든 값에 동일하게 적용되지 않을 수 있습니다.';
             const plan = document.createElement('pre');
             plan.textContent = planText(bottleneckPlan);
-            td.append(heading, note, indexTable(assessment, bottleneckPlan.database), plan);
+            td.append(heading, note);
+            const whereDetails = whereIndexDetails(bottleneckPlan);
+            if (whereDetails) td.append(whereDetails);
+            td.append(indexTable(assessment, bottleneckPlan.database), plan);
           } else {
             const note = document.createElement('p');
             note.textContent = bottleneckError || '실행 계획 조회 중…';
@@ -400,6 +411,33 @@
       }
       visit(plan.root, 0);
       return lines.join('\n');
+    }
+    function whereIndexBadge(plan) {
+      const missing = (plan?.where_columns || []).filter(column => !column.index_names.length);
+      if (!missing.length) return null;
+      const badge = document.createElement('span');
+      badge.className = 'where-column unindexed';
+      badge.textContent = `WHERE 인덱스 없음: ${missing.map(column => `${column.table}.${column.column}`).join(', ')}`;
+      return badge;
+    }
+    function whereIndexDetails(plan) {
+      if (!plan?.where_columns?.length) return null;
+      const box = document.createElement('div');
+      const heading = document.createElement('strong');
+      heading.textContent = 'WHERE 컬럼의 인덱스 정의';
+      const columns = document.createElement('div');
+      columns.className = 'where-columns';
+      for (const column of plan.where_columns) {
+        const item = document.createElement('span');
+        item.className = `where-column${column.index_names.length ? '' : ' unindexed'}`;
+        item.textContent = `${column.table}.${column.column} · ${column.index_names.length ? column.index_names.join(', ') : '인덱스 없음'}`;
+        columns.append(item);
+      }
+      const note = document.createElement('p');
+      note.className = 'muted';
+      note.textContent = '빨간색은 컬럼이 인덱스 정의에 없다는 뜻입니다. 인덱스 추가가 항상 유리한 것은 아니며, 기존 인덱스도 이번 계획에서 쓰이지 않을 수 있습니다.';
+      box.append(heading, columns, note);
+      return box;
     }
     function indexAssessment(plan) {
       const rows = [];
@@ -541,6 +579,8 @@
           tr.title = '클릭하면 실행 계획을 조회';
           tr.onclick = () => selectQuery(row);
           const plan = planResults.get(row.key);
+          const badge = whereIndexBadge(plan);
+          if (badge) sql.append(document.createElement('br'), badge);
           const estimateText = metric => !/^select\s/i.test(row.statement_text.trim()) ? '정보 없음' : planResults.has(row.key) ? metric(plan) : '조회 중…';
           tr.append(cell(row.namespace), sql, cell(row.calls), cell(ms(row.total_time_ms)), cell(ms(row.mean_time_ms)), cell(row.rows_examined == null ? '정보 없음' : Number(row.rows_examined).toLocaleString()), cell(estimateText(estimatedRows)), cell(estimateText(estimatedCost)), cell(row.source === 'MySqlGeneralLog' && row.total_time_ms != null ? '일반 로그 + 성능 통계' : row.source));
           $('queries').append(tr);
@@ -589,7 +629,10 @@
               raw.className = 'scroll';
               raw.append(rawExplainTable(selectedPlan.raw_explain, selectedPlan.database));
               details.append(label, raw);
-              td.append(title, indexBox, indexTable(assessment, selectedPlan.database), indexColumnsNote, summary, details);
+              td.append(title, indexBox);
+              const whereDetails = whereIndexDetails(selectedPlan);
+              if (whereDetails) td.append(whereDetails);
+              td.append(indexTable(assessment, selectedPlan.database), indexColumnsNote, summary, details);
             }
             detail.append(td);
             $('queries').append(detail);

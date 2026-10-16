@@ -13,6 +13,7 @@ use crate::model::{
 
 use super::general_log::GeneralLogCollector;
 use super::performance::PerformanceCollector;
+use super::where_columns;
 use crate::timeline::MinuteRange;
 
 pub struct MySqlBackend {
@@ -167,14 +168,23 @@ impl DatabaseBackend for MySqlBackend {
                     .iter()
                     .map(traditional_explain_row)
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok((raw_json, rows))
+                let schema: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                let where_columns = match schema {
+                    Some(schema) => where_columns::inspect(&mut connection, sql, &schema)
+                        .await
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                Ok((raw_json, rows, where_columns))
             }
             .await;
             // A changed default database must never leak to another pool borrower.
             if request.namespace.is_some() {
                 connection.close().await.map_err(query_error)?;
             }
-            let (raw_json, rows) = result.map_err(query_error)?;
+            let (raw_json, rows, where_columns) = result.map_err(query_error)?;
             let value: serde_json::Value = serde_json::from_str(&raw_json).map_err(json_error)?;
             Ok(ExplainPlan {
                 database: DatabaseKind::MySql,
@@ -201,6 +211,7 @@ impl DatabaseBackend for MySqlBackend {
                     .collect(),
                     rows,
                 },
+                where_columns,
             })
         })
     }
